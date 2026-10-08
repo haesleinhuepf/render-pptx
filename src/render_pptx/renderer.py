@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.enum.dml import MSO_FILL
+from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu
 
 _FONTS = ["DejaVuSans.ttf", "Arial.ttf", "arial.ttf", "LiberationSans-Regular.ttf"]
@@ -110,30 +111,32 @@ class _Canvas:
         self.image.paste(layer, pos, layer)
 
 
+_ALIGN = {"l": PP_ALIGN.LEFT, "ctr": PP_ALIGN.CENTER, "r": PP_ALIGN.RIGHT, "just": PP_ALIGN.JUSTIFY}
 _TOKEN_RE = re.compile(r"\t|[\n\v]|[^ \t\n\v]+ *| +")
 _DEFAULT_TAB_EMU = 914400
 _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 
-def _tab_stops(para):
-    """Return (sorted [(pos_emu, align)], default tab size in EMU) of a paragraph (ruler tabs)."""
-    stops, default = [], _DEFAULT_TAB_EMU
-    pPr = para._p.pPr
-    if pPr is not None:
-        if pPr.get("defTabSz"):
-            default = max(int(pPr.get("defTabSz")), 1)
-        for tab in pPr.iter(_A_NS + "tab"):
-            if tab.get("pos") is not None:
-                stops.append((int(tab.get("pos")), tab.get("algn", "l")))
-    return sorted(stops), default
-
-
-def _indents(para):
-    """Return (marL, indent) of a paragraph in EMU."""
-    pPr = para._p.pPr
-    get = (lambda k: int(pPr.get(k))) if pPr is not None else (lambda k: 0)
-    return (get("marL") if pPr is not None and pPr.get("marL") else 0,
-            get("indent") if pPr is not None and pPr.get("indent") else 0)
+def _para_props(canvas, shape, para):
+    """Resolve paragraph properties (inheriting from list styles, layout, master) as a dict:
+    marL, indent (EMU), algn, defTabSz (EMU) and tabs ([(pos_emu, align)] sorted)."""
+    chain = [para._p.pPr] if para._p.pPr is not None else []
+    chain += list(_style_sources(canvas, shape, para.level, None))
+    res = {"marL": 0, "indent": 0, "algn": None, "defTabSz": _DEFAULT_TAB_EMU, "tabs": []}
+    seen = set()
+    for el in chain:
+        for key in ("marL", "indent", "algn", "defTabSz"):
+            if key not in seen and el.get(key) is not None:
+                seen.add(key)
+                res[key] = el.get(key) if key == "algn" else int(el.get(key))
+        if "tabs" not in seen:
+            tabs = [(int(t.get("pos")), t.get("algn", "l")) for t in el.iter(_A_NS + "tab")
+                    if t.get("pos") is not None]
+            if tabs:
+                seen.add("tabs")
+                res["tabs"] = sorted(tabs)
+    res["defTabSz"] = max(res["defTabSz"], 1)
+    return res
 
 
 _A = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -154,9 +157,9 @@ def _theme_fonts(master):
         return {}
 
 
-def _style_sources(canvas, shape, level):
-    """Yield defRPr elements from most to least specific for a text level."""
-    tag = "a:lvl%dpPr/a:defRPr" % (level + 1)
+def _style_sources(canvas, shape, level, leaf="a:defRPr"):
+    """Yield list-style elements (defRPr, or pPr itself if leaf is None) from most to least specific."""
+    tag = "a:lvl%dpPr" % (level + 1) + ("/" + leaf if leaf else "")
 
     def lst(txbody):
         if txbody is not None:
@@ -280,8 +283,10 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
 
     lines = []  # (placed items, line width, align, height)
     for para in text_frame.paragraphs:
-        stops, default_tab = _tab_stops(para)
-        mar_l, indent = _indents(para)
+        props = _para_props(canvas, shape, para)
+        stops, default_tab = props["tabs"], props["defTabSz"]
+        mar_l, indent = props["marL"], props["indent"]
+        align = _ALIGN.get(props["algn"], para.alignment)
         if mar_l and indent < 0:  # hanging indent: the left margin acts as a tab stop
             stops = sorted(stops + [(mar_l, "l")])
         first_start = canvas.px(max(mar_l + indent, 0))
@@ -304,7 +309,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
                 tokens.append((tok, font, color, fpx))
         if not tokens:
             h = canvas.px(Emu(127000))
-            lines.append(([], 0, para.alignment, h * 1.2))
+            lines.append(([], 0, align, h * 1.2))
             continue
 
         cur = []
@@ -317,7 +322,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
                 placed, width = _layout_line(draw, cur, canvas, stops, default_tab, start)
                 width = max(
                     (x + draw.textlength(t.rstrip(" "), font=f) for x, t, f, _c in placed), default=0)
-                lines.append((placed, width, para.alignment, max(t[3] for t in cur) * 1.2))
+                lines.append((placed, width, align, max(t[3] for t in cur) * 1.2))
             cur = []
 
         for tok in tokens:

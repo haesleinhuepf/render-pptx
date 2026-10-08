@@ -138,3 +138,21 @@ def test_inherited_size_and_font_name(tmp_path):
     assert seen[0][0] > 19  # title is not rendered with the 18pt fallback
     assert seen[0][1] == "Calibri"
     assert seen[-1] == (17, "DejaVu Sans")
+
+
+def test_inherited_indentation_and_tabs(tmp_path):
+    from lxml import etree
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
+    tf = tb.text_frame
+    tf.paragraphs[0].add_run().text = "A"
+    tf.add_paragraph().add_run().text = "B"
+    # indentation and tab stops defined once in the shape's list style, not per paragraph
+    lst = tf._txBody.find("{%s}lstStyle" % ns)
+    lvl = etree.SubElement(lst, "{%s}lvl1pPr" % ns, marL=str(int(Inches(2))))
+    path = tmp_path / "inh.pptx"
+    prs.save(path)  # (list style is inserted before save so python-pptx keeps it)
+    img = render_slide(path, 0, width=1000)
+    assert min(_dark_columns(img)) >= 300
