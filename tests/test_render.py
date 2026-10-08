@@ -42,3 +42,42 @@ def test_shape_and_cropped_picture(tmp_path):
 def test_export_png(tmp_path):
     paths = render_presentation(_deck(tmp_path), tmp_path / "out", width=500)
     assert len(paths) == 1 and Image.open(paths[0]).format == "PNG"
+
+
+def _text_deck(tmp_path, text, rotation=0, tabs=()):
+    from lxml import etree
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
+    tb.rotation = rotation
+    para = tb.text_frame.paragraphs[0]
+    para.add_run().text = text
+    if tabs:
+        ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        pPr = para._p.get_or_add_pPr()
+        lst = etree.SubElement(pPr, "{%s}tabLst" % ns)
+        for pos in tabs:
+            etree.SubElement(lst, "{%s}tab" % ns, pos=str(int(Inches(pos))), algn="l")
+    path = tmp_path / "txt.pptx"
+    prs.save(path)
+    return path
+
+
+def _dark_columns(img):
+    return [x for x in range(img.width)
+            if any(img.getpixel((x, y))[0] < 100 for y in range(img.height))]
+
+
+def test_tab_uses_ruler_position(tmp_path):
+    img = render_slide(_text_deck(tmp_path, "A\tB", tabs=(4,)), 0, width=1000)
+    cols = _dark_columns(img)
+    # "B" starts at 1in margin + 0.1in inset + 4in tab = 5.1in -> 510px of 1000px (10in)
+    assert any(500 <= x <= 530 for x in cols)
+    assert not any(130 < x < 500 for x in cols)
+
+
+def test_text_rotation(tmp_path):
+    img = render_slide(_text_deck(tmp_path, "HELLO WORLD", rotation=90), 0, width=1000)
+    cols = _dark_columns(img)
+    # horizontal text spans wide; rotated by 90 it becomes narrow
+    assert max(cols) - min(cols) < 100

@@ -1,6 +1,7 @@
 """Render pptx slides onto a PIL canvas."""
 import io
 import os
+import re
 
 from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
@@ -78,51 +79,132 @@ class _Canvas:
         self.image.paste(layer, pos, layer)
 
 
-def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0)):
+_TOKEN_RE = re.compile(r"\t|[\n\v]|[^ \t\n\v]+ *| +")
+_DEFAULT_TAB_EMU = 914400
+_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _tab_stops(para):
+    """Return (sorted [(pos_emu, align)], default tab size in EMU) of a paragraph (ruler tabs)."""
+    stops, default = [], _DEFAULT_TAB_EMU
+    pPr = para._p.pPr
+    if pPr is not None:
+        if pPr.get("defTabSz"):
+            default = max(int(pPr.get("defTabSz")), 1)
+        for tab in pPr.iter(_A_NS + "tab"):
+            if tab.get("pos") is not None:
+                stops.append((int(tab.get("pos")), tab.get("algn", "l")))
+    return sorted(stops), default
+
+
+def _text_rotation(shape_rotation, text_frame):
+    """Total rotation (degrees) of text: shape rotation plus bodyPr rot."""
+    rot = shape_rotation or 0
+    try:
+        body_rot = text_frame._txBody.bodyPr.get("rot")
+        if body_rot:
+            rot += int(body_rot) / 60000.0
+    except Exception:
+        pass
+    return rot % 360
+
+
+def _layout_line(draw, tokens, canvas, stops, default_tab):
+    """Place tokens of one line; returns [(x, text, font, color)] and the line width."""
+    placed, x = [], 0.0
+    i = 0
+    while i < len(tokens):
+        text, font, color, _ = tokens[i]
+        if text == "\t":
+            nxt = next(((canvas.px(p), al) for p, al in stops if canvas.px(p) > x + 0.5), None)
+            if nxt is None:
+                step = canvas.px(default_tab)
+                nxt = ((x // step + 1) * step, "l")
+            pos, align = nxt
+            if align in ("ctr", "r", "dec"):
+                seg = 0.0
+                for t, f, _c, _s in tokens[i + 1:]:
+                    if t == "\t":
+                        break
+                    seg += draw.textlength(t, font=f)
+                x = max(pos - (seg / 2 if align == "ctr" else seg), x)
+            else:
+                x = pos
+        else:
+            placed.append((x, text, font, color))
+            x += draw.textlength(text, font=font)
+        i += 1
+    return placed, x
+
+
+def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0):
+    if rotation:
+        # draw on a padded transparent layer centred on the box, then rotate it onto the canvas
+        w, h = box[2] - box[0], box[3] - box[1]
+        pad = int(max(w, h))
+        layer = Image.new("RGBA", (int(w) + 2 * pad + 1, int(h) + 2 * pad + 1), (0, 0, 0, 0))
+        local = (pad, pad, pad + w, pad + h)
+        _render_text(canvas, layer, text_frame, local, default_color)
+        canvas.paste_rotated(layer, box, rotation)
+    else:
+        _render_text(canvas, canvas.image, text_frame, box, default_color)
+
+
+def _render_text(canvas, target, text_frame, box, default_color):
     x0, y0, x1, y1 = box
     pad_l = canvas.px(text_frame.margin_left)
     pad_r = canvas.px(text_frame.margin_right)
     pad_t = canvas.px(text_frame.margin_top)
     pad_b = canvas.px(text_frame.margin_bottom)
     avail = max(x1 - x0 - pad_l - pad_r, 1)
-    draw = ImageDraw.Draw(canvas.image)
+    draw = ImageDraw.Draw(target)
 
-    lines = []  # (text, font, color, align, height)
+    lines = []  # (placed items, line width, align, height)
     for para in text_frame.paragraphs:
-        runs = [r for r in para.runs if r.text]
-        if not runs:
-            lines.append(("", _font(canvas.px(Emu(127000))), default_color, None, canvas.px(Emu(127000)) * 1.2))
-            continue
-        # one font/color per paragraph line chunk; wrap per run words
-        words = []
-        for r in runs:
+        stops, default_tab = _tab_stops(para)
+        tokens = []
+        for r in para.runs:
+            if not r.text:
+                continue
             size = r.font.size or (para.font.size if para.font.size else Emu(18 * 12700))
             fpx = canvas.px(size)
             font = _font(fpx, bool(r.font.bold))
-            color = default_color
             try:
                 color = _rgb(r.font.color) or default_color
             except Exception:
-                pass
-            for i, wd in enumerate(r.text.replace("\v", "\n").split(" ")):
-                words.append((wd, font, color, fpx))
-        cur, cur_w = [], 0
+                color = default_color
+            for tok in _TOKEN_RE.findall(r.text):
+                tokens.append((tok, font, color, fpx))
+        if not tokens:
+            h = canvas.px(Emu(127000))
+            lines.append(([], 0, para.alignment, h * 1.2))
+            continue
+
+        cur = []
+
         def flush():
-            nonlocal cur, cur_w
+            nonlocal cur
             if cur:
-                h = max(w[3] for w in cur) * 1.2
-                lines.append((cur, None, None, para.alignment, h))
-            cur, cur_w = [], 0
-        for wd, font, color, fpx in words:
-            ww = draw.textlength(wd + " ", font=font)
-            if cur and cur_w + ww > avail + draw.textlength(" ", font=font):
+                placed, width = _layout_line(draw, cur, canvas, stops, default_tab)
+                width = max(
+                    (x + draw.textlength(t.rstrip(" "), font=f) for x, t, f, _c in placed), default=0)
+                lines.append((placed, width, para.alignment, max(t[3] for t in cur) * 1.2))
+            cur = []
+
+        for tok in tokens:
+            text, font = tok[0], tok[1]
+            if text in ("\n", "\v"):
                 flush()
-            cur.append((wd, font, color, fpx))
-            cur_w += ww
+                continue
+            if text != "\t" and cur:
+                _p, cur_w = _layout_line(draw, cur, canvas, stops, default_tab)
+                if cur_w + draw.textlength(text.rstrip(" "), font=font) > avail:
+                    flush()
+            cur.append(tok)
         flush()
 
-    total = sum(l[4] for l in lines)
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+    total = sum(l[3] for l in lines)
     anchor = text_frame.vertical_anchor
     inner_h = y1 - y0 - pad_t - pad_b
     y = y0 + pad_t
@@ -130,19 +212,14 @@ def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0)):
         y += (inner_h - total) / 2
     elif anchor == MSO_ANCHOR.BOTTOM:
         y += inner_h - total
-    for content, _f, _c, align, h in lines:
-        if isinstance(content, str):
-            y += h
-            continue
-        line_w = sum(draw.textlength(w[0] + " ", font=w[1]) for w in content) - draw.textlength(" ", font=content[-1][1])
-        x = x0 + pad_l
+    for placed, line_w, align, h in lines:
+        shift = 0
         if align == PP_ALIGN.CENTER:
-            x += (avail - line_w) / 2
+            shift = (avail - line_w) / 2
         elif align == PP_ALIGN.RIGHT:
-            x += avail - line_w
-        for wd, font, color, fpx in content:
-            draw.text((x, y), wd, font=font, fill=color)
-            x += draw.textlength(wd + " ", font=font)
+            shift = avail - line_w
+        for x, text, font, color in placed:
+            draw.text((x0 + pad_l + shift + x, y), text.rstrip(" "), font=font, fill=color)
         y += h
 
 
@@ -263,7 +340,8 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
     if fill or line:
         _draw_shape_geometry(canvas, shape, box, fill, line, line_w)
     if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
-        _draw_text(canvas, shape.text_frame, box)
+        _draw_text(canvas, shape.text_frame, box,
+                   rotation=_text_rotation(getattr(shape, "rotation", 0), shape.text_frame))
 
 
 def _background(canvas, slide):

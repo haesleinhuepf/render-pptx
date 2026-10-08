@@ -26,5 +26,5 @@ render-pptx deck.pptx out_folder --width 1920
 ```
 
 Supported: backgrounds (solid), auto shapes (rectangles, ellipses, others as
-rectangles) with solid fill/line, text, pictures (with crop and rotation),
+rectangles) with solid fill/line, text (tab stops from the ruler, text rotation), pictures (with crop and rotation),
 tables, groups, connectors/lines. Gradients and other effects are approximated or ignored.
