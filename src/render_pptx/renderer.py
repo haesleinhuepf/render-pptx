@@ -97,6 +97,14 @@ def _tab_stops(para):
     return sorted(stops), default
 
 
+def _indents(para):
+    """Return (marL, indent) of a paragraph in EMU."""
+    pPr = para._p.pPr
+    get = (lambda k: int(pPr.get(k))) if pPr is not None else (lambda k: 0)
+    return (get("marL") if pPr is not None and pPr.get("marL") else 0,
+            get("indent") if pPr is not None and pPr.get("indent") else 0)
+
+
 def _text_rotation(shape_rotation, text_frame):
     """Total rotation (degrees) of text: shape rotation plus bodyPr rot."""
     rot = shape_rotation or 0
@@ -109,9 +117,9 @@ def _text_rotation(shape_rotation, text_frame):
     return rot % 360
 
 
-def _layout_line(draw, tokens, canvas, stops, default_tab):
+def _layout_line(draw, tokens, canvas, stops, default_tab, start=0.0):
     """Place tokens of one line; returns [(x, text, font, color)] and the line width."""
-    placed, x = [], 0.0
+    placed, x = [], start
     i = 0
     while i < len(tokens):
         text, font, color, _ = tokens[i]
@@ -162,11 +170,18 @@ def _render_text(canvas, target, text_frame, box, default_color):
     lines = []  # (placed items, line width, align, height)
     for para in text_frame.paragraphs:
         stops, default_tab = _tab_stops(para)
+        mar_l, indent = _indents(para)
+        if mar_l and indent < 0:  # hanging indent: the left margin acts as a tab stop
+            stops = sorted(stops + [(mar_l, "l")])
+        first_start = canvas.px(max(mar_l + indent, 0))
+        rest_start = canvas.px(mar_l)
+        line_no = 0
         tokens = []
         for r in para.runs:
             if not r.text:
                 continue
             size = r.font.size or (para.font.size if para.font.size else Emu(18 * 12700))
+            size = max(size - 12700, 12700)  # always render 1pt smaller than specified
             fpx = canvas.px(size)
             font = _font(fpx, bool(r.font.bold))
             try:
@@ -183,9 +198,11 @@ def _render_text(canvas, target, text_frame, box, default_color):
         cur = []
 
         def flush():
-            nonlocal cur
+            nonlocal cur, line_no
             if cur:
-                placed, width = _layout_line(draw, cur, canvas, stops, default_tab)
+                start = first_start if line_no == 0 else rest_start
+                line_no += 1
+                placed, width = _layout_line(draw, cur, canvas, stops, default_tab, start)
                 width = max(
                     (x + draw.textlength(t.rstrip(" "), font=f) for x, t, f, _c in placed), default=0)
                 lines.append((placed, width, para.alignment, max(t[3] for t in cur) * 1.2))
@@ -197,7 +214,8 @@ def _render_text(canvas, target, text_frame, box, default_color):
                 flush()
                 continue
             if text != "\t" and cur:
-                _p, cur_w = _layout_line(draw, cur, canvas, stops, default_tab)
+                start = first_start if line_no == 0 else rest_start
+                _p, cur_w = _layout_line(draw, cur, canvas, stops, default_tab, start)
                 if cur_w + draw.textlength(text.rstrip(" "), font=font) > avail:
                     flush()
             cur.append(tok)

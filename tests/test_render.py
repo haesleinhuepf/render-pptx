@@ -81,3 +81,37 @@ def test_text_rotation(tmp_path):
     cols = _dark_columns(img)
     # horizontal text spans wide; rotated by 90 it becomes narrow
     assert max(cols) - min(cols) < 100
+
+
+def test_indentation_without_tab(tmp_path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
+    para = tb.text_frame.paragraphs[0]
+    para.add_run().text = "Indented"
+    para._p.get_or_add_pPr().set("marL", str(int(Inches(2))))
+    path = tmp_path / "ind.pptx"
+    prs.save(path)
+    cols = _dark_columns(render_slide(path, 0, width=1000))
+    assert min(cols) >= 300  # 1in box + 0.1in inset + 2in indent -> 310px
+
+
+def test_font_one_point_smaller(tmp_path):
+    from render_pptx import renderer
+    sizes = []
+    orig = renderer._font
+    renderer._font = lambda size, bold=False: sizes.append(size) or orig(size, bold)
+    try:
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        tb = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+        run = tb.text_frame.paragraphs[0].add_run()
+        run.text = "x"
+        from pptx.util import Pt
+        run.font.size = Pt(20)
+        path = tmp_path / "f.pptx"
+        prs.save(path)
+        render_slide(path, 0, width=720)  # 720px / 10in = 72 px per in = 1px per pt
+    finally:
+        renderer._font = orig
+    assert sizes == [19]
