@@ -2,6 +2,7 @@
 import io
 import os
 import re
+import subprocess
 
 from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
@@ -13,11 +14,39 @@ _FONTS = ["DejaVuSans.ttf", "Arial.ttf", "arial.ttf", "LiberationSans-Regular.tt
 _FONTS_BOLD = ["DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf", "LiberationSans-Bold.ttf"]
 
 
-def _font(size, bold=False):
-    size = max(int(size), 1)
-    for name in (_FONTS_BOLD if bold else []) + _FONTS:
+_font_files = {}
+
+
+def _font_file(name, bold, italic):
+    """Locate a font file for a family name using fontconfig (cached); None if unavailable."""
+    key = (name, bold, italic)
+    if key not in _font_files:
+        path = None
+        pattern = name + (":bold" if bold else "") + (":italic" if italic else "")
         try:
-            return ImageFont.truetype(name, size)
+            out = subprocess.run(["fc-match", "-f", "%{family}|%{file}", pattern],
+                                 capture_output=True, text=True, timeout=10).stdout
+            family, _, path = out.partition("|")
+            wanted = name.lower()
+            if wanted not in [f.strip().lower() for f in family.split(",")]:
+                path = None  # fontconfig substituted another family
+        except (OSError, subprocess.SubprocessError):
+            path = None
+        _font_files[key] = path or None
+    return _font_files[key]
+
+
+def _font(size, bold=False, name=None, italic=False):
+    size = max(int(size), 1)
+    candidates = []
+    if name:
+        candidates += [_font_file(name, bold, italic), name + ".ttf"]
+    candidates += (_FONTS_BOLD if bold else []) + _FONTS
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            return ImageFont.truetype(cand, size)
         except OSError:
             continue
     return ImageFont.load_default(size)
@@ -57,6 +86,8 @@ class _Canvas:
         self.scale = width_px / width_emu
         self.size = (width_px, max(1, round(height_emu * self.scale)))
         self.image = Image.new("RGB", self.size, (255, 255, 255))
+        self.prs = self.master = None
+        self.theme_fonts = {}
 
     def px(self, emu):
         return emu * self.scale
@@ -105,6 +136,86 @@ def _indents(para):
             get("indent") if pPr is not None and pPr.get("indent") else 0)
 
 
+_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_NS = {"a": _A}
+
+
+def _theme_fonts(master):
+    """Return {'+mj-lt': major latin font, '+mn-lt': minor latin font} of the master's theme."""
+    try:
+        from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+        from lxml import etree
+        theme = etree.fromstring(master.part.part_related_by(RT.THEME).blob)
+        return {
+            "+mj-lt": theme.find(".//a:majorFont/a:latin", _NS).get("typeface"),
+            "+mn-lt": theme.find(".//a:minorFont/a:latin", _NS).get("typeface"),
+        }
+    except Exception:
+        return {}
+
+
+def _style_sources(canvas, shape, level):
+    """Yield defRPr elements from most to least specific for a text level."""
+    tag = "a:lvl%dpPr/a:defRPr" % (level + 1)
+
+    def lst(txbody):
+        if txbody is not None:
+            for el in txbody.xpath("a:lstStyle/" + tag):
+                yield el
+
+    kind = "other"
+    if shape is not None and shape.is_placeholder:
+        ph = shape.placeholder_format.type
+        if ph in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+            kind = "title"
+        elif ph not in (PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER):
+            kind = "body"
+    cur = shape
+    for _ in range(3):  # shape -> layout placeholder -> master placeholder
+        if cur is None:
+            break
+        yield from lst(cur._element.find("{http://schemas.openxmlformats.org/presentationml/2006/main}txBody"))
+        cur = getattr(cur, "_base_placeholder", None) if cur.is_placeholder else None
+    master = canvas.master
+    if master is not None:
+        styles = master._element.xpath("p:txStyles/p:%sStyle" % kind)
+        for st in styles:
+            yield from st.xpath(tag, namespaces=_NS)
+    if canvas.prs is not None:
+        yield from canvas.prs._element.xpath("p:defaultTextStyle/" + tag)
+
+
+def _run_props(canvas, shape, para, run):
+    """Resolve (size in EMU, bold, italic, font name) of a run, following inheritance."""
+    chain = [run._r.rPr] if run._r.rPr is not None else []
+    chain += list(_style_sources(canvas, shape, para.level))
+    size = bold = italic = name = None
+    for el in chain:
+        if size is None and el.get("sz"):
+            size = int(el.get("sz")) * 127  # hundredths of a point -> EMU
+        if bold is None and el.get("b") is not None:
+            bold = el.get("b") in ("1", "true")
+        if italic is None and el.get("i") is not None:
+            italic = el.get("i") in ("1", "true")
+        if name is None:
+            latin = el.find("a:latin", _NS)
+            if latin is not None and latin.get("typeface"):
+                name = latin.get("typeface")
+    name = canvas.theme_fonts.get(name, name) if name else canvas.theme_fonts.get("+mn-lt")
+    return (size or 18 * 12700), bool(bold), bool(italic), name
+
+
+def _font_scale(text_frame):
+    """Scale applied by PowerPoint's 'shrink text on overflow' (normAutofit fontScale)."""
+    try:
+        el = text_frame._txBody.bodyPr.find("a:normAutofit", _NS)
+        if el is not None and el.get("fontScale"):
+            return int(el.get("fontScale")) / 100000.0
+    except Exception:
+        pass
+    return 1.0
+
+
 def _text_rotation(shape_rotation, text_frame):
     """Total rotation (degrees) of text: shape rotation plus bodyPr rot."""
     rot = shape_rotation or 0
@@ -145,20 +256,20 @@ def _layout_line(draw, tokens, canvas, stops, default_tab, start=0.0):
     return placed, x
 
 
-def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0):
+def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0, shape=None):
     if rotation:
         # draw on a padded transparent layer centred on the box, then rotate it onto the canvas
         w, h = box[2] - box[0], box[3] - box[1]
         pad = int(max(w, h))
         layer = Image.new("RGBA", (int(w) + 2 * pad + 1, int(h) + 2 * pad + 1), (0, 0, 0, 0))
         local = (pad, pad, pad + w, pad + h)
-        _render_text(canvas, layer, text_frame, local, default_color)
+        _render_text(canvas, layer, text_frame, local, default_color, shape)
         canvas.paste_rotated(layer, box, rotation)
     else:
-        _render_text(canvas, canvas.image, text_frame, box, default_color)
+        _render_text(canvas, canvas.image, text_frame, box, default_color, shape)
 
 
-def _render_text(canvas, target, text_frame, box, default_color):
+def _render_text(canvas, target, text_frame, box, default_color, shape=None):
     x0, y0, x1, y1 = box
     pad_l = canvas.px(text_frame.margin_left)
     pad_r = canvas.px(text_frame.margin_right)
@@ -180,10 +291,11 @@ def _render_text(canvas, target, text_frame, box, default_color):
         for r in para.runs:
             if not r.text:
                 continue
-            size = r.font.size or (para.font.size if para.font.size else Emu(18 * 12700))
-            size = max(size - 12700, 12700)  # always render 1pt smaller than specified
+            size, bold, italic, name = _run_props(canvas, shape, para, r)
+            # always render 1pt smaller than specified
+            size = max(size * _font_scale(text_frame) - 12700, 12700)
             fpx = canvas.px(size)
-            font = _font(fpx, bool(r.font.bold))
+            font = _font(fpx, bold, name, italic)
             try:
                 color = _rgb(r.font.color) or default_color
             except Exception:
@@ -359,7 +471,7 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
         _draw_shape_geometry(canvas, shape, box, fill, line, line_w)
     if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
         _draw_text(canvas, shape.text_frame, box,
-                   rotation=_text_rotation(getattr(shape, "rotation", 0), shape.text_frame))
+                   rotation=_text_rotation(getattr(shape, "rotation", 0), shape.text_frame), shape=shape)
 
 
 def _background(canvas, slide):
@@ -376,6 +488,9 @@ def _background(canvas, slide):
 
 def _render(prs, slide, width):
     canvas = _Canvas(prs.slide_width, prs.slide_height, width)
+    canvas.prs = prs
+    canvas.master = slide.slide_layout.slide_master
+    canvas.theme_fonts = _theme_fonts(canvas.master)
     _background(canvas, slide)
     layout = slide.slide_layout
     # master elements first, then layout, then the slide itself

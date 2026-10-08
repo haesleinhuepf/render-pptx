@@ -100,7 +100,7 @@ def test_font_one_point_smaller(tmp_path):
     from render_pptx import renderer
     sizes = []
     orig = renderer._font
-    renderer._font = lambda size, bold=False: sizes.append(size) or orig(size, bold)
+    renderer._font = lambda size, bold=False, name=None, italic=False: sizes.append(size) or orig(size, bold, name, italic)
     try:
         prs = Presentation()
         slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -115,3 +115,26 @@ def test_font_one_point_smaller(tmp_path):
     finally:
         renderer._font = orig
     assert sizes == [19]
+
+
+def test_inherited_size_and_font_name(tmp_path):
+    from render_pptx import renderer
+    seen = []
+    orig = renderer._font
+    renderer._font = lambda size, bold=False, name=None, italic=False: seen.append((size, name)) or orig(size, bold, name, italic)
+    try:
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[0])  # title slide
+        slide.shapes.title.text = "T"  # size from master title style (44pt), theme font
+        tb = slide.shapes.add_textbox(Inches(1), Inches(5), Inches(4), Inches(1))
+        run = tb.text_frame.paragraphs[0].add_run()
+        run.text = "x"
+        run.font.name = "DejaVu Sans"
+        path = tmp_path / "i.pptx"
+        prs.save(path)
+        render_slide(path, 0, width=720)
+    finally:
+        renderer._font = orig
+    assert seen[0][0] > 19  # title is not rendered with the 18pt fallback
+    assert seen[0][1] == "Calibri"
+    assert seen[-1] == (17, "DejaVu Sans")
