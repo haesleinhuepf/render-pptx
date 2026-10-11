@@ -3,6 +3,7 @@ import io
 from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.dml import MSO_THEME_COLOR
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Inches
 
@@ -115,6 +116,43 @@ def test_font_one_point_smaller(tmp_path):
     finally:
         renderer._font = orig
     assert sizes == [19]
+
+
+def test_theme_text_color(tmp_path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    run = tb.text_frame.paragraphs[0].add_run()
+    run.text = "X"
+    run.font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
+    path = tmp_path / "theme-color.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    pixels = img.load()
+    assert any(pixels[x, y] == (79, 129, 189)
+               for y in range(img.height) for x in range(img.width))
+
+
+def test_inherited_theme_text_color(tmp_path):
+    from lxml import etree
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    tb.text_frame.paragraphs[0].add_run().text = "X"
+    lst = tb.text_frame._txBody.find("{%s}lstStyle" % ns)
+    lvl = etree.SubElement(lst, "{%s}lvl1pPr" % ns)
+    rpr = etree.SubElement(lvl, "{%s}defRPr" % ns)
+    fill = etree.SubElement(rpr, "{%s}solidFill" % ns)
+    etree.SubElement(fill, "{%s}schemeClr" % ns, val="accent1")
+    path = tmp_path / "inherited-theme-color.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    pixels = img.load()
+    assert any(pixels[x, y] == (79, 129, 189)
+               for y in range(img.height) for x in range(img.width))
 
 
 def test_inherited_size_and_font_name(tmp_path):

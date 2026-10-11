@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.enum.dml import MSO_FILL
@@ -53,7 +53,15 @@ def _font(size, bold=False, name=None, italic=False):
     return ImageFont.load_default(size)
 
 
-def _rgb(color_format):
+_THEME_COLOR_KEYS = {
+    "DARK_1": "dk1", "LIGHT_1": "lt1", "DARK_2": "dk2", "LIGHT_2": "lt2",
+    "TEXT_1": "dk1", "BACKGROUND_1": "lt1", "TEXT_2": "dk2", "BACKGROUND_2": "lt2",
+    "HYPERLINK": "hlink", "FOLLOWED_HYPERLINK": "folHlink",
+    **{"ACCENT_%d" % i: "accent%d" % i for i in range(1, 7)},
+}
+
+
+def _rgb(color_format, theme_colors=None):
     """Return an RGB tuple for a python-pptx ColorFormat, or None."""
     try:
         if color_format.type is None:
@@ -62,24 +70,43 @@ def _rgb(color_format):
     except (AttributeError, KeyError, TypeError, ValueError):
         pass
     try:  # theme colors have no direct rgb
-        from pptx.enum.dml import MSO_THEME_COLOR as T
+        theme_color = color_format.theme_color
+        name = getattr(theme_color, "name", "")
+        key = _THEME_COLOR_KEYS.get(name)
+        if theme_colors and key in theme_colors:
+            return theme_colors[key]
         return {
-            T.BACKGROUND_1: (255, 255, 255), T.LIGHT_1: (255, 255, 255),
-            T.TEXT_1: (0, 0, 0), T.DARK_1: (0, 0, 0),
-        }.get(color_format.theme_color)
+            "BACKGROUND_1": (255, 255, 255), "LIGHT_1": (255, 255, 255),
+            "TEXT_1": (0, 0, 0), "DARK_1": (0, 0, 0),
+        }.get(name)
     except Exception:
         return None
 
 
-def _fill_color(fill):
+def _fill_color(fill, theme_colors=None):
     try:
         if fill.type == MSO_FILL.SOLID:
-            return _rgb(fill.fore_color)
+            return _rgb(fill.fore_color, theme_colors)
         if fill.type == MSO_FILL.GRADIENT:
-            return _rgb(fill.gradient_stops[0].color)
+            return _rgb(fill.gradient_stops[0].color, theme_colors)
     except Exception:
         pass
     return None
+
+
+def _alpha(fill_parent, fill_tag="solidFill"):
+    """Opacity (0-255) from an a:alpha child of the color in fill_parent/a:<fill_tag>; 255 if absent."""
+    try:
+        vals = fill_parent.xpath(f"./a:{fill_tag}/*/a:alpha/@val")
+        if vals:
+            return max(0, min(255, round(int(vals[0]) / 100000 * 255)))
+    except Exception:
+        pass
+    return 255
+
+
+def _with_alpha(color, alpha):
+    return None if color is None else (*color[:3], alpha)
 
 
 class _Canvas:
@@ -89,6 +116,7 @@ class _Canvas:
         self.image = Image.new("RGB", self.size, (255, 255, 255))
         self.prs = self.master = None
         self.theme_fonts = {}
+        self.theme_colors = {}
 
     def px(self, emu):
         return emu * self.scale
@@ -153,6 +181,27 @@ def _theme_fonts(master):
             "+mj-lt": theme.find(".//a:majorFont/a:latin", _NS).get("typeface"),
             "+mn-lt": theme.find(".//a:minorFont/a:latin", _NS).get("typeface"),
         }
+    except Exception:
+        return {}
+
+
+def _theme_colors(master):
+    """Return the theme's named color scheme as RGB tuples."""
+    try:
+        from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+        from lxml import etree
+        theme = etree.fromstring(master.part.part_related_by(RT.THEME).blob)
+        scheme = theme.find(".//a:clrScheme", _NS)
+        colors = {}
+        for entry in scheme:
+            color = entry[0]
+            value = color.get("lastClr") if color.tag == _A_NS + "sysClr" else color.get("val")
+            if value:
+                colors[entry.tag.rsplit("}", 1)[-1]] = tuple(
+                    int(value[i:i + 2], 16) for i in (0, 2, 4))
+        colors.update({"tx1": colors.get("dk1"), "bg1": colors.get("lt1"),
+                       "tx2": colors.get("dk2"), "bg2": colors.get("lt2")})
+        return colors
     except Exception:
         return {}
 
@@ -231,6 +280,26 @@ def _text_rotation(shape_rotation, text_frame):
     return rot % 360
 
 
+def _run_color(canvas, shape, para, run, default_color):
+    """Resolve a run's explicit or inherited solid text color."""
+    chain = [run._r.rPr] if run._r.rPr is not None else []
+    chain += list(_style_sources(canvas, shape, para.level))
+    for el in chain:
+        solid_fill = el.find("a:solidFill", _NS)
+        if solid_fill is None or len(solid_fill) == 0:
+            continue
+        color = solid_fill[0]
+        value = color.get("lastClr") if color.tag == _A_NS + "sysClr" else color.get("val")
+        if not value:
+            continue
+        if color.tag == _A_NS + "schemeClr":
+            key = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}.get(value, value)
+            return canvas.theme_colors.get(key, default_color)
+        if color.tag in (_A_NS + "srgbClr", _A_NS + "sysClr"):
+            return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return default_color
+
+
 def _layout_line(draw, tokens, canvas, stops, default_tab, start=0.0):
     """Place tokens of one line; returns [(x, text, font, color)] and the line width."""
     placed, x = [], start
@@ -301,10 +370,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
             size = max(size * _font_scale(text_frame) - 12700, 12700)
             fpx = canvas.px(size)
             font = _font(fpx, bold, name, italic)
-            try:
-                color = _rgb(r.font.color) or default_color
-            except Exception:
-                color = default_color
+            color = _run_color(canvas, shape, para, r, default_color)
             for tok in _TOKEN_RE.findall(r.text):
                 tokens.append((tok, font, color, fpx))
         if not tokens:
@@ -358,11 +424,34 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
         y += h
 
 
+def _load_metafile(img, target_px=1600):
+    """Rasterize an EMF/WMF at high resolution (Windows only); white becomes transparent."""
+    try:
+        w, h = img.size
+        dpi = img.info.get("dpi", 72)
+        dpi = dpi[0] if isinstance(dpi, tuple) else dpi
+        img.load(dpi=dpi * max(target_px / max(w, h, 1), 1))
+    except Exception:
+        return None
+    img = img.convert("RGBA")
+    # the metafile is drawn onto an opaque white background
+    r, g, b, _ = img.split()
+    is_white = [c.point(lambda v: 255 if v == 255 else 0) for c in (r, g, b)]
+    white = ImageChops.multiply(ImageChops.multiply(is_white[0], is_white[1]), is_white[2])
+    img.putalpha(ImageChops.invert(white))
+    return img
+
+
 def _picture_image(shape):
     """Return the picture cropped according to its crop information."""
     img = Image.open(io.BytesIO(shape.image.blob))
-    img.load()
-    img = img.convert("RGBA")
+    if img.format in ("WMF", "EMF"):
+        img = _load_metafile(img)
+        if img is None:
+            return None
+    else:
+        img.load()
+        img = img.convert("RGBA")
     w, h = img.size
     l, t, r, b = shape.crop_left, shape.crop_top, shape.crop_right, shape.crop_bottom
     # negative crop values pad the image with transparency
@@ -420,7 +509,7 @@ def _draw_table(canvas, shape, box):
             if cell.is_spanned:
                 x += cw
                 continue
-            c = _fill_color(cell.fill)
+            c = _fill_color(cell.fill, canvas.theme_colors)
             draw.rectangle((x, y, x + cw, y + rh), fill=c, outline=(128, 128, 128))
             _draw_text(canvas, cell.text_frame, (x, y, x + cw, y + rh))
             x += cw
@@ -435,6 +524,124 @@ def _draw_shapes(canvas, shapes, ox=0, oy=0, sx=1.0, sy=1.0, skip_placeholders=F
             _draw_shape(canvas, shape, ox, oy, sx, sy)
         except Exception:  # never fail a whole slide for one odd shape
             continue
+
+
+_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+# dash pattern as (dash, gap) in multiples of line width
+_DASHES = {
+    "dot": (1, 2), "sysDot": (1, 1), "dash": (4, 3), "sysDash": (3, 1),
+    "lgDash": (8, 3), "dashDot": (4, 3, 1, 3), "sysDashDot": (3, 1, 1, 1),
+    "lgDashDot": (8, 3, 1, 3), "lgDashDotDot": (8, 3, 1, 3, 1, 3),
+    "sysDashDotDot": (3, 1, 1, 1, 1, 1),
+}
+
+
+def _draw_dashed(draw, p0, p1, pattern, width, fill):
+    import math
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return
+    ux, uy = dx / length, dy / length
+    pos, i = 0.0, 0
+    while pos < length:
+        seg = max(pattern[i % len(pattern)] * width, 1)
+        if i % 2 == 0:
+            end = min(pos + seg, length)
+            draw.line((p0[0] + ux * pos, p0[1] + uy * pos, p0[0] + ux * end, p0[1] + uy * end),
+                      fill=fill, width=width)
+        pos += seg
+        i += 1
+
+
+def _draw_arrow_head(draw, tip, frm, kind, size_w, width, fill):
+    import math
+    dx, dy = tip[0] - frm[0], tip[1] - frm[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    s = max(size_w * width, 6)
+    bx, by = tip[0] - ux * s, tip[1] - uy * s
+    if kind == "oval":
+        r = s / 2
+        cx, cy = tip[0] - ux * r, tip[1] - uy * r
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=fill)
+    elif kind == "diamond":
+        r = s / 2
+        cx, cy = tip[0] - ux * r, tip[1] - uy * r
+        draw.polygon([tip, (cx + nx * r, cy + ny * r), (bx, by), (cx - nx * r, cy - ny * r)], fill=fill)
+    elif kind in ("stealth", "arrow"):
+        notch = s * (0.7 if kind == "stealth" else 1.0)
+        nxp, nyp = tip[0] - ux * notch, tip[1] - uy * notch
+        if kind == "stealth":
+            draw.polygon([tip, (bx + nx * s / 2, by + ny * s / 2), (nxp, nyp),
+                          (bx - nx * s / 2, by - ny * s / 2)], fill=fill)
+        else:
+            w = max(width, 2)
+            for sgn in (1, -1):
+                draw.line((tip[0], tip[1], bx + sgn * nx * s / 2, by + sgn * ny * s / 2), fill=fill, width=w)
+    else:  # triangle
+        draw.polygon([tip, (bx + nx * s / 2, by + ny * s / 2), (bx - nx * s / 2, by - ny * s / 2)], fill=fill)
+
+
+def _draw_line_shape(canvas, shape, box):
+    import math
+    color = _rgb(shape.line.color, canvas.theme_colors) or (0, 0, 0)
+    width = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
+    xfrm = shape._element.spPr.find(_A_NS + "xfrm")
+    flip_h = flip_v = False
+    rot = 0.0
+    if xfrm is not None:
+        flip_h = xfrm.get("flipH") in ("1", "true")
+        flip_v = xfrm.get("flipV") in ("1", "true")
+        rot = int(xfrm.get("rot", 0)) / 60000.0
+    x0, y0, x1, y1 = box
+    p0 = [x1 if flip_h else x0, y1 if flip_v else y0]
+    p1 = [x0 if flip_h else x1, y0 if flip_v else y1]
+    if rot:
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+        for p in (p0, p1):
+            rx, ry = p[0] - cx, p[1] - cy
+            p[0], p[1] = cx + rx * c - ry * s, cy + rx * s + ry * c
+    ln = shape._element.spPr.find(_A_NS + "ln")
+    dash = None
+    head = tail = None
+    if ln is not None:
+        pd = ln.find(_A_NS + "prstDash")
+        if pd is not None:
+            dash = _DASHES.get(pd.get("val"))
+        for tag in ("headEnd", "tailEnd"):
+            el = ln.find(_A_NS + tag)
+            if el is not None and el.get("type", "none") != "none":
+                info = (el.get("type"), {"sm": 2, "med": 3, "lg": 5}.get(el.get("w", "med"), 3))
+                if tag == "headEnd":
+                    head = info
+                else:
+                    tail = info
+    draw = ImageDraw.Draw(canvas.image)
+    a, b = tuple(p0), tuple(p1)
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    # shorten the line at arrow ends so its thickness doesn't poke out past the tip
+    la, lb = a, b
+    if length:
+        ux, uy = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+        cut_a = width * 1.5 if head else 0
+        cut_b = width * 1.5 if tail else 0
+        if cut_a + cut_b < length:
+            la = (a[0] + ux * cut_a, a[1] + uy * cut_a)
+            lb = (b[0] - ux * cut_b, b[1] - uy * cut_b)
+    if dash:
+        _draw_dashed(draw, la, lb, dash, width, color)
+    else:
+        draw.line((la[0], la[1], lb[0], lb[1]), fill=color, width=width)
+    if length:
+        if head:
+            _draw_arrow_head(draw, a, b, head[0], head[1], width, color)
+        if tail:
+            _draw_arrow_head(draw, b, a, tail[0], tail[1], width, color)
 
 
 def _draw_shape(canvas, shape, ox, oy, sx, sy):
@@ -459,16 +666,16 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
         _draw_table(canvas, shape, box)
         return
     if st == MSO_SHAPE_TYPE.LINE or shape.__class__.__name__ == "Connector":
-        color = _rgb(shape.line.color) or (0, 0, 0)
-        width = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
-        ImageDraw.Draw(canvas.image).line((box[0], box[1], box[2], box[3]), fill=color, width=width)
+        _draw_line_shape(canvas, shape, box)
         return
     fill = line = None
     line_w = 0
     try:
-        fill = _fill_color(shape.fill)
+        sppr = shape._element.spPr
+        fill = _with_alpha(_fill_color(shape.fill, canvas.theme_colors), _alpha(sppr))
         if shape.line.fill.type == MSO_FILL.SOLID:
-            line = _rgb(shape.line.color)
+            ln = sppr.find("{http://schemas.openxmlformats.org/drawingml/2006/main}ln")
+            line = _with_alpha(_rgb(shape.line.color, canvas.theme_colors), _alpha(ln) if ln is not None else 255)
             line_w = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
     except Exception:
         pass
@@ -483,7 +690,7 @@ def _background(canvas, slide):
     for obj in (slide, slide.slide_layout, slide.slide_layout.slide_master):
         try:
             fill = obj.background.fill
-            c = _fill_color(fill)
+            c = _fill_color(fill, canvas.theme_colors)
             if c:
                 canvas.image.paste(c, (0, 0, *canvas.size))
                 return
@@ -496,6 +703,7 @@ def _render(prs, slide, width):
     canvas.prs = prs
     canvas.master = slide.slide_layout.slide_master
     canvas.theme_fonts = _theme_fonts(canvas.master)
+    canvas.theme_colors = _theme_colors(canvas.master)
     _background(canvas, slide)
     layout = slide.slide_layout
     # master elements first, then layout, then the slide itself
