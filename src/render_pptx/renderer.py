@@ -305,7 +305,7 @@ def _layout_line(draw, tokens, canvas, stops, default_tab, start=0.0):
     placed, x = [], start
     i = 0
     while i < len(tokens):
-        text, font, color, _ = tokens[i]
+        text, font, color, _, ul = tokens[i]
         if text == "\t":
             nxt = next(((canvas.px(p), al) for p, al in stops if canvas.px(p) > x + 0.5), None)
             if nxt is None:
@@ -314,7 +314,7 @@ def _layout_line(draw, tokens, canvas, stops, default_tab, start=0.0):
             pos, align = nxt
             if align in ("ctr", "r", "dec"):
                 seg = 0.0
-                for t, f, _c, _s in tokens[i + 1:]:
+                for t, f, _c, _s, _u in tokens[i + 1:]:
                     if t == "\t":
                         break
                     seg += draw.textlength(t, font=f)
@@ -322,10 +322,85 @@ def _layout_line(draw, tokens, canvas, stops, default_tab, start=0.0):
             else:
                 x = pos
         else:
-            placed.append((x, text, font, color))
+            placed.append((x, text, font, color, ul))
             x += draw.textlength(text, font=font)
         i += 1
     return placed, x
+
+
+class _RunShim:
+    """Uniform view of a:r, a:br and a:fld paragraph children."""
+
+    def __init__(self, el):
+        self._r = self
+        self.el = el
+        self.tag = el.tag
+        self.rPr = el.find("a:rPr", _NS)
+        t = el.find("a:t", _NS)
+        self.text = (t.text or "") if t is not None else ""
+
+
+def _para_runs(para):
+    for el in para._p:
+        if el.tag in (_A_NS + "r", _A_NS + "br", _A_NS + "fld"):
+            yield _RunShim(el)
+
+
+def _xml_color(el, theme_colors):
+    """RGBA of a color element (srgbClr/schemeClr/...) with lumMod/lumOff/tint/shade/alpha applied."""
+    import colorsys
+    value = el.get("lastClr") if el.tag == _A_NS + "sysClr" else el.get("val")
+    if el.tag == _A_NS + "schemeClr":
+        key = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}.get(value, value)
+        rgb = theme_colors.get(key)
+    elif el.tag in (_A_NS + "srgbClr", _A_NS + "sysClr") and value:
+        rgb = tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+    else:
+        rgb = None
+    if rgb is None:
+        return None
+    alpha = 255
+    h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in rgb))
+    for mod in el:
+        v = int(mod.get("val", "0")) / 100000
+        name = mod.tag.rsplit("}", 1)[-1]
+        if name == "lumMod":
+            l = min(l * v, 1)
+        elif name == "lumOff":
+            l = min(max(l + v, 0), 1)
+        elif name == "alpha":
+            alpha = round(v * 255)
+        elif name == "tint":
+            l = l * v + (1 - v)
+        elif name == "shade":
+            l = l * v
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return (round(r * 255), round(g * 255), round(b * 255), alpha)
+
+
+def _shape_fill(shape, theme_colors):
+    """RGBA fill of a shape: explicit spPr fill, else the style's fillRef; None if no fill."""
+    try:
+        sppr = shape._element.spPr
+    except AttributeError:
+        return None
+    if sppr.find("a:noFill", _NS) is not None:
+        return None
+    for tag in ("a:solidFill", "a:gradFill"):
+        fill = sppr.find(tag, _NS)
+        if fill is None:
+            continue
+        if tag == "a:gradFill":
+            fill = fill.find("a:gsLst/a:gs", _NS)
+        if fill is not None and len(fill):
+            return _xml_color(fill[0], theme_colors)
+        return None
+    if sppr.find("a:blipFill", _NS) is not None or sppr.find("a:pattFill", _NS) is not None:
+        return None
+    ref = shape._element.find("{http://schemas.openxmlformats.org/presentationml/2006/main}style/a:fillRef", _NS)
+    if ref is not None and ref.get("idx", "0") != "0" and len(ref):
+        return _xml_color(ref[0], theme_colors)
+    return None
 
 
 def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0, shape=None):
@@ -362,8 +437,9 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
         rest_start = canvas.px(mar_l)
         line_no = 0
         tokens = []
-        for r in para.runs:
-            if not r.text:
+        for r in _para_runs(para):
+            is_br = r._r.tag == _A_NS + "br"
+            if not is_br and not r.text:
                 continue
             size, bold, italic, name = _run_props(canvas, shape, para, r)
             # always render 1pt smaller than specified
@@ -371,8 +447,16 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
             fpx = canvas.px(size)
             font = _font(fpx, bold, name, italic)
             color = _run_color(canvas, shape, para, r, default_color)
+            rpr = r._r.rPr
+            underline = rpr is not None and rpr.get("u", "none") != "none"
+            if rpr is not None and rpr.find("a:hlinkClick", _NS) is not None:
+                color = canvas.theme_colors.get("hlink") or (5, 99, 193)
+                underline = True
+            if is_br:
+                tokens.append(("\n", font, color, fpx, False))
+                continue
             for tok in _TOKEN_RE.findall(r.text):
-                tokens.append((tok, font, color, fpx))
+                tokens.append((tok, font, color, fpx, underline))
         if not tokens:
             h = canvas.px(Emu(127000))
             lines.append(([], 0, align, h * 1.2))
@@ -387,14 +471,17 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
                 line_no += 1
                 placed, width = _layout_line(draw, cur, canvas, stops, default_tab, start)
                 width = max(
-                    (x + draw.textlength(t.rstrip(" "), font=f) for x, t, f, _c in placed), default=0)
+                    (x + draw.textlength(t.rstrip(" "), font=f) for x, t, f, _c, _u in placed), default=0)
                 lines.append((placed, width, align, max(t[3] for t in cur) * 1.2))
             cur = []
 
         for tok in tokens:
             text, font = tok[0], tok[1]
             if text in ("\n", "\v"):
-                flush()
+                if cur:
+                    flush()
+                else:  # consecutive break: empty line
+                    lines.append(([], 0, align, tok[3] * 1.2))
                 continue
             if text != "\t" and cur:
                 start = first_start if line_no == 0 else rest_start
@@ -419,8 +506,14 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
             shift = (avail - line_w) / 2
         elif align == PP_ALIGN.RIGHT:
             shift = avail - line_w
-        for x, text, font, color in placed:
-            draw.text((x0 + pad_l + shift + x, y), text.rstrip(" "), font=font, fill=color)
+        for x, text, font, color, ul in placed:
+            tx, shown = x0 + pad_l + shift + x, text.rstrip(" ")
+            draw.text((tx, y), shown, font=font, fill=color)
+            if ul and shown:
+                asc, _desc = font.getmetrics()
+                uy = y + asc + max(font.size * 0.08, 1)
+                draw.line([(tx, uy), (tx + draw.textlength(shown, font=font), uy)],
+                          fill=color, width=max(round(font.size / 14), 1))
         y += h
 
 
@@ -672,7 +765,9 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
     line_w = 0
     try:
         sppr = shape._element.spPr
-        fill = _with_alpha(_fill_color(shape.fill, canvas.theme_colors), _alpha(sppr))
+        fill = _shape_fill(shape, canvas.theme_colors)
+        if fill is None and shape.fill.type is not None:
+            fill = _with_alpha(_fill_color(shape.fill, canvas.theme_colors), _alpha(sppr))
         if shape.line.fill.type == MSO_FILL.SOLID:
             ln = sppr.find("{http://schemas.openxmlformats.org/drawingml/2006/main}ln")
             line = _with_alpha(_rgb(shape.line.color, canvas.theme_colors), _alpha(ln) if ln is not None else 255)
