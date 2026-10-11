@@ -82,6 +82,21 @@ def _fill_color(fill):
     return None
 
 
+def _alpha(fill_parent, fill_tag="solidFill"):
+    """Opacity (0-255) from an a:alpha child of the color in fill_parent/a:<fill_tag>; 255 if absent."""
+    try:
+        vals = fill_parent.xpath(f"./a:{fill_tag}/*/a:alpha/@val")
+        if vals:
+            return max(0, min(255, round(int(vals[0]) / 100000 * 255)))
+    except Exception:
+        pass
+    return 255
+
+
+def _with_alpha(color, alpha):
+    return None if color is None else (*color[:3], alpha)
+
+
 class _Canvas:
     def __init__(self, width_emu, height_emu, width_px):
         self.scale = width_px / width_emu
@@ -437,6 +452,115 @@ def _draw_shapes(canvas, shapes, ox=0, oy=0, sx=1.0, sy=1.0, skip_placeholders=F
             continue
 
 
+_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+# dash pattern as (dash, gap) in multiples of line width
+_DASHES = {
+    "dot": (1, 2), "sysDot": (1, 1), "dash": (4, 3), "sysDash": (3, 1),
+    "lgDash": (8, 3), "dashDot": (4, 3, 1, 3), "sysDashDot": (3, 1, 1, 1),
+    "lgDashDot": (8, 3, 1, 3), "lgDashDotDot": (8, 3, 1, 3, 1, 3),
+    "sysDashDotDot": (3, 1, 1, 1, 1, 1),
+}
+
+
+def _draw_dashed(draw, p0, p1, pattern, width, fill):
+    import math
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return
+    ux, uy = dx / length, dy / length
+    pos, i = 0.0, 0
+    while pos < length:
+        seg = max(pattern[i % len(pattern)] * width, 1)
+        if i % 2 == 0:
+            end = min(pos + seg, length)
+            draw.line((p0[0] + ux * pos, p0[1] + uy * pos, p0[0] + ux * end, p0[1] + uy * end),
+                      fill=fill, width=width)
+        pos += seg
+        i += 1
+
+
+def _draw_arrow_head(draw, tip, frm, kind, size_w, width, fill):
+    import math
+    dx, dy = tip[0] - frm[0], tip[1] - frm[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    s = max(size_w * width, 6)
+    bx, by = tip[0] - ux * s, tip[1] - uy * s
+    if kind == "oval":
+        r = s / 2
+        cx, cy = tip[0] - ux * r, tip[1] - uy * r
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=fill)
+    elif kind == "diamond":
+        r = s / 2
+        cx, cy = tip[0] - ux * r, tip[1] - uy * r
+        draw.polygon([tip, (cx + nx * r, cy + ny * r), (bx, by), (cx - nx * r, cy - ny * r)], fill=fill)
+    elif kind in ("stealth", "arrow"):
+        notch = s * (0.7 if kind == "stealth" else 1.0)
+        nxp, nyp = tip[0] - ux * notch, tip[1] - uy * notch
+        if kind == "stealth":
+            draw.polygon([tip, (bx + nx * s / 2, by + ny * s / 2), (nxp, nyp),
+                          (bx - nx * s / 2, by - ny * s / 2)], fill=fill)
+        else:
+            w = max(width, 2)
+            for sgn in (1, -1):
+                draw.line((tip[0], tip[1], bx + sgn * nx * s / 2, by + sgn * ny * s / 2), fill=fill, width=w)
+    else:  # triangle
+        draw.polygon([tip, (bx + nx * s / 2, by + ny * s / 2), (bx - nx * s / 2, by - ny * s / 2)], fill=fill)
+
+
+def _draw_line_shape(canvas, shape, box):
+    import math
+    color = _rgb(shape.line.color) or (0, 0, 0)
+    width = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
+    xfrm = shape._element.spPr.find(_A_NS + "xfrm")
+    flip_h = flip_v = False
+    rot = 0.0
+    if xfrm is not None:
+        flip_h = xfrm.get("flipH") in ("1", "true")
+        flip_v = xfrm.get("flipV") in ("1", "true")
+        rot = int(xfrm.get("rot", 0)) / 60000.0
+    x0, y0, x1, y1 = box
+    p0 = [x1 if flip_h else x0, y1 if flip_v else y0]
+    p1 = [x0 if flip_h else x1, y0 if flip_v else y1]
+    if rot:
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+        for p in (p0, p1):
+            rx, ry = p[0] - cx, p[1] - cy
+            p[0], p[1] = cx + rx * c - ry * s, cy + rx * s + ry * c
+    ln = shape._element.spPr.find(_A_NS + "ln")
+    dash = None
+    head = tail = None
+    if ln is not None:
+        pd = ln.find(_A_NS + "prstDash")
+        if pd is not None:
+            dash = _DASHES.get(pd.get("val"))
+        for tag in ("headEnd", "tailEnd"):
+            el = ln.find(_A_NS + tag)
+            if el is not None and el.get("type", "none") != "none":
+                info = (el.get("type"), {"sm": 2, "med": 3, "lg": 5}.get(el.get("w", "med"), 3))
+                if tag == "headEnd":
+                    head = info
+                else:
+                    tail = info
+    draw = ImageDraw.Draw(canvas.image)
+    a, b = tuple(p0), tuple(p1)
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    if dash:
+        _draw_dashed(draw, a, b, dash, width, color)
+    else:
+        draw.line((a[0], a[1], b[0], b[1]), fill=color, width=width)
+    if length:
+        if head:
+            _draw_arrow_head(draw, a, b, head[0], head[1], width, color)
+        if tail:
+            _draw_arrow_head(draw, b, a, tail[0], tail[1], width, color)
+
+
 def _draw_shape(canvas, shape, ox, oy, sx, sy):
     st = shape.shape_type
     if st == MSO_SHAPE_TYPE.GROUP:
@@ -459,16 +583,16 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
         _draw_table(canvas, shape, box)
         return
     if st == MSO_SHAPE_TYPE.LINE or shape.__class__.__name__ == "Connector":
-        color = _rgb(shape.line.color) or (0, 0, 0)
-        width = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
-        ImageDraw.Draw(canvas.image).line((box[0], box[1], box[2], box[3]), fill=color, width=width)
+        _draw_line_shape(canvas, shape, box)
         return
     fill = line = None
     line_w = 0
     try:
-        fill = _fill_color(shape.fill)
+        sppr = shape._element.spPr
+        fill = _with_alpha(_fill_color(shape.fill), _alpha(sppr))
         if shape.line.fill.type == MSO_FILL.SOLID:
-            line = _rgb(shape.line.color)
+            ln = sppr.find("{http://schemas.openxmlformats.org/drawingml/2006/main}ln")
+            line = _with_alpha(_rgb(shape.line.color), _alpha(ln) if ln is not None else 255)
             line_w = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
     except Exception:
         pass
