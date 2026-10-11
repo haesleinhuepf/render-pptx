@@ -194,3 +194,104 @@ def test_inherited_indentation_and_tabs(tmp_path):
     prs.save(path)  # (list style is inserted before save so python-pptx keeps it)
     img = render_slide(path, 0, width=1000)
     assert min(_dark_columns(img)) >= 300
+
+
+def test_table_theme_fill_modifiers(tmp_path):
+    from lxml import etree
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    table = slide.shapes.add_table(1, 1, Inches(1), Inches(1), Inches(2), Inches(2)).table
+    cell = table.cell(0, 0)
+    cell.fill.solid()
+    cell.fill.fore_color.theme_color = MSO_THEME_COLOR.ACCENT_6
+    scheme_color = cell._tc.tcPr.find("{%s}solidFill/{%s}schemeClr" % (ns, ns))
+    etree.SubElement(scheme_color, "{%s}lumMod" % ns, val="60000")
+    etree.SubElement(scheme_color, "{%s}lumOff" % ns, val="40000")
+    path = tmp_path / "table-theme-fill.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    assert img.getpixel((144, 144)) == (250, 192, 144)
+
+
+def test_table_style_alternating_fills_and_cell_override(tmp_path):
+    from lxml import etree
+    from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    table = slide.shapes.add_table(3, 1, Inches(1), Inches(1), Inches(2), Inches(3)).table
+    cell = table.cell(2, 0)
+    cell.fill.solid()
+    cell.fill.fore_color.rgb = RGBColor(0, 255, 0)
+    path = tmp_path / "table-style-fills.pptx"
+    prs.save(path)
+
+    prs = Presentation(path)
+    table = next(shape.table for shape in prs.slides[0].shapes if shape.has_table)
+    style_id = "{21E4AEA4-8DFA-4A89-87EB-49C32662AFE0}"
+    table._tbl.tblPr.find("{%s}tableStyleId" % ns).text = style_id
+    table._tbl.tblPr.set("firstRow", "0")
+    table._tbl.tblPr.set("bandRow", "1")
+
+    style_part = prs.part.part_related_by(RT.TABLE_STYLES)
+    styles = etree.fromstring(style_part.blob)
+    style = etree.SubElement(
+        styles, "{%s}tblStyle" % ns,
+        styleId="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}",
+        styleName="Medium Style 2 - Accent 1")
+    whole_fill = etree.SubElement(etree.SubElement(
+        etree.SubElement(style, "{%s}wholeTbl" % ns), "{%s}tcStyle" % ns),
+        "{%s}fill" % ns)
+    etree.SubElement(etree.SubElement(whole_fill, "{%s}solidFill" % ns),
+                     "{%s}schemeClr" % ns, val="accent1")
+    band_fill = etree.SubElement(etree.SubElement(
+        etree.SubElement(style, "{%s}band1H" % ns), "{%s}tcStyle" % ns),
+        "{%s}fill" % ns)
+    band_color = etree.SubElement(etree.SubElement(
+        band_fill, "{%s}solidFill" % ns), "{%s}schemeClr" % ns, val="accent1")
+    etree.SubElement(band_color, "{%s}tint" % ns, val="50000")
+    style_part._blob = etree.tostring(styles, xml_declaration=True, encoding="UTF-8")
+
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    assert img.getpixel((144, 108)) == (79, 129, 189)
+    assert img.getpixel((144, 180)) == (79, 129, 189)
+    assert img.getpixel((144, 252)) == (0, 255, 0)
+
+
+def test_table_style_uses_declared_theme_color(tmp_path):
+    from lxml import etree
+    from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    table = slide.shapes.add_table(1, 1, Inches(1), Inches(1), Inches(2), Inches(2)).table
+    table._tbl.tblPr.set("firstRow", "0")
+    table._tbl.tblPr.set("bandRow", "1")
+    style_id = "{8A0DE7A6-89E2-40E7-9C1E-5849B6C87C28}"
+    table._tbl.tblPr.find("{%s}tableStyleId" % ns).text = style_id
+
+    style_part = prs.part.part_related_by(RT.TABLE_STYLES)
+    styles = etree.fromstring(style_part.blob)
+    style = etree.SubElement(styles, "{%s}tblStyle" % ns, styleId=style_id)
+    fill = etree.SubElement(
+        etree.SubElement(
+            etree.SubElement(
+                etree.SubElement(style, "{%s}band1H" % ns), "{%s}tcStyle" % ns),
+            "{%s}fill" % ns),
+        "{%s}solidFill" % ns)
+    color = etree.SubElement(fill, "{%s}schemeClr" % ns, val="accent4")
+    etree.SubElement(color, "{%s}alpha" % ns, val="40000")
+    style_part._blob = etree.tostring(styles, xml_declaration=True, encoding="UTF-8")
+
+    path = tmp_path / "table-style-alpha-fill.pptx"
+    prs.save(path)
+    img = render_slide(path, 0, width=720)
+    from render_pptx.renderer import _theme_colors
+    theme = _theme_colors(Presentation(path).slide_masters[0])
+    assert img.getpixel((144, 144)) == theme["accent4"]

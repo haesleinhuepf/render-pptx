@@ -117,6 +117,8 @@ class _Canvas:
         self.prs = self.master = None
         self.theme_fonts = {}
         self.theme_colors = {}
+        self.table_styles = {}
+        self.default_table_style = None
 
     def px(self, emu):
         return emu * self.scale
@@ -360,22 +362,25 @@ def _xml_color(el, theme_colors):
     if rgb is None:
         return None
     alpha = 255
-    h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in rgb))
+    rgb = tuple(c / 255 for c in rgb)
     for mod in el:
         v = int(mod.get("val", "0")) / 100000
         name = mod.tag.rsplit("}", 1)[-1]
         if name == "lumMod":
+            h, l, s = colorsys.rgb_to_hls(*rgb)
             l = min(l * v, 1)
+            rgb = colorsys.hls_to_rgb(h, l, s)
         elif name == "lumOff":
+            h, l, s = colorsys.rgb_to_hls(*rgb)
             l = min(max(l + v, 0), 1)
+            rgb = colorsys.hls_to_rgb(h, l, s)
         elif name == "alpha":
-            alpha = round(v * 255)
+            alpha = round(min(max(v, 0), 1) * 255)
         elif name == "tint":
-            l = l * v + (1 - v)
+            rgb = tuple(c + (1 - c) * v for c in rgb)
         elif name == "shade":
-            l = l * v
-    r, g, b = colorsys.hls_to_rgb(h, l, s)
-    return (round(r * 255), round(g * 255), round(b * 255), alpha)
+            rgb = tuple(c * v for c in rgb)
+    return (*tuple(round(c * 255) for c in rgb), alpha)
 
 
 def _shape_fill(shape, theme_colors):
@@ -589,8 +594,79 @@ def _draw_shape_geometry(canvas, shape, box, fill, line, line_w):
     canvas.paste_rotated(layer, box, getattr(shape, "rotation", 0))
 
 
+def _table_styles(prs):
+    """Return table styles in the presentation and its default table-style ID."""
+    from lxml import etree
+    from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+    try:
+        part = prs.part.part_related_by(RT.TABLE_STYLES)
+    except KeyError:
+        return {}, None
+    root = etree.fromstring(part.blob)
+    styles = {
+        style.get("styleId").strip("{}").lower(): style
+        for style in root.findall("a:tblStyle", _NS)
+        if style.get("styleId")
+    }
+    default = root.get("def")
+    return styles, default.strip("{}").lower() if default else None
+
+
+def _table_style_for_id(style_id, styles, default_style_id=None):
+    """Use a defined table style, or the presentation's declared default."""
+    style = styles.get(style_id)
+    return style if style is not None else styles.get(default_style_id)
+
+
+def _table_style_regions(tbl_pr, row, col, row_count, col_count):
+    regions = []
+    if row == 0 and tbl_pr.get("firstRow") in ("1", "true"):
+        regions.append("firstRow")
+    if row == row_count - 1 and tbl_pr.get("lastRow") in ("1", "true"):
+        regions.append("lastRow")
+    if col == 0 and tbl_pr.get("firstCol") in ("1", "true"):
+        regions.append("firstCol")
+    if col == col_count - 1 and tbl_pr.get("lastCol") in ("1", "true"):
+        regions.append("lastCol")
+    if tbl_pr.get("bandRow") in ("1", "true"):
+        band_row = row - (1 if tbl_pr.get("firstRow") in ("1", "true") else 0)
+        if band_row >= 0:
+            regions.append("band%dH" % (band_row % 2 + 1))
+    if tbl_pr.get("bandCol") in ("1", "true"):
+        band_col = col - (1 if tbl_pr.get("firstCol") in ("1", "true") else 0)
+        if band_col >= 0:
+            regions.append("band%dV" % (band_col % 2 + 1))
+    regions.append("wholeTbl")
+    return regions
+
+
+def _table_style_fill(style, tbl_pr, row, col, row_count, col_count, theme_colors):
+    """Return the base RGB color declared for the applicable table-style fill."""
+    if style is None:
+        return None
+    aliases = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}
+    for name in _table_style_regions(tbl_pr, row, col, row_count, col_count):
+        region = style.find("a:" + name + "/a:tcStyle", _NS)
+        fill = region.find("a:fill", _NS) if region is not None else None
+        color = fill.find("a:solidFill/*", _NS) if fill is not None else None
+        if color is None:
+            continue
+        value = color.get("lastClr") if color.tag == _A_NS + "sysClr" else color.get("val")
+        if color.tag == _A_NS + "schemeClr":
+            key = aliases.get(value, value)
+            return theme_colors.get(key)
+        if color.tag in (_A_NS + "srgbClr", _A_NS + "sysClr") and value:
+            return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return None
+
+
 def _draw_table(canvas, shape, box):
     table = shape.table
+    tbl_pr = table._tbl.tblPr
+    style_id = tbl_pr.find("a:tableStyleId", _NS)
+    style_id = style_id.text.strip("{}").lower() if style_id is not None and style_id.text else None
+    style = _table_style_for_id(
+        style_id, canvas.table_styles, canvas.default_table_style)
     draw = ImageDraw.Draw(canvas.image)
     y = box[1]
     for ri, row in enumerate(table.rows):
@@ -602,7 +678,19 @@ def _draw_table(canvas, shape, box):
             if cell.is_spanned:
                 x += cw
                 continue
-            c = _fill_color(cell.fill, canvas.theme_colors)
+            tcpr = cell._tc.tcPr
+            if tcpr is not None and tcpr.find("a:noFill", _NS) is not None:
+                c = None
+            else:
+                solid_fill = tcpr.find("a:solidFill", _NS) if tcpr is not None else None
+                if solid_fill is not None and len(solid_fill):
+                    c = _xml_color(solid_fill[0], canvas.theme_colors)
+                else:
+                    c = _fill_color(cell.fill, canvas.theme_colors)
+                    if c is None:
+                        c = _table_style_fill(
+                            style, tbl_pr, ri, ci, len(table.rows), len(table.columns),
+                            canvas.theme_colors)
             draw.rectangle((x, y, x + cw, y + rh), fill=c, outline=(128, 128, 128))
             _draw_text(canvas, cell.text_frame, (x, y, x + cw, y + rh))
             x += cw
@@ -799,6 +887,7 @@ def _render(prs, slide, width):
     canvas.master = slide.slide_layout.slide_master
     canvas.theme_fonts = _theme_fonts(canvas.master)
     canvas.theme_colors = _theme_colors(canvas.master)
+    canvas.table_styles, canvas.default_table_style = _table_styles(prs)
     _background(canvas, slide)
     layout = slide.slide_layout
     # master elements first, then layout, then the slide itself
