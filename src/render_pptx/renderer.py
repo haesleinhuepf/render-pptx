@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.enum.dml import MSO_FILL
@@ -373,11 +373,34 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
         y += h
 
 
+def _load_metafile(img, target_px=1600):
+    """Rasterize an EMF/WMF at high resolution (Windows only); white becomes transparent."""
+    try:
+        w, h = img.size
+        dpi = img.info.get("dpi", 72)
+        dpi = dpi[0] if isinstance(dpi, tuple) else dpi
+        img.load(dpi=dpi * max(target_px / max(w, h, 1), 1))
+    except Exception:
+        return None
+    img = img.convert("RGBA")
+    # the metafile is drawn onto an opaque white background
+    r, g, b, _ = img.split()
+    is_white = [c.point(lambda v: 255 if v == 255 else 0) for c in (r, g, b)]
+    white = ImageChops.multiply(ImageChops.multiply(is_white[0], is_white[1]), is_white[2])
+    img.putalpha(ImageChops.invert(white))
+    return img
+
+
 def _picture_image(shape):
     """Return the picture cropped according to its crop information."""
     img = Image.open(io.BytesIO(shape.image.blob))
-    img.load()
-    img = img.convert("RGBA")
+    if img.format in ("WMF", "EMF"):
+        img = _load_metafile(img)
+        if img is None:
+            return None
+    else:
+        img.load()
+        img = img.convert("RGBA")
     w, h = img.size
     l, t, r, b = shape.crop_left, shape.crop_top, shape.crop_right, shape.crop_bottom
     # negative crop values pad the image with transparency
