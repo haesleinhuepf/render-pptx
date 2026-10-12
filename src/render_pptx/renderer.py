@@ -903,6 +903,16 @@ def render_slide(pptx, index=0, width=1920):
     return _render(prs, prs.slides[index], width)
 
 
+def render_slides(prs, indexes=None, width=1920):
+    """Render the slides at ``indexes`` (0-based; all slides if None) as a list of PIL images."""
+    if not hasattr(prs, "slides"):
+        prs = Presentation(prs)
+    slides = list(prs.slides)
+    if indexes is None:
+        indexes = range(len(slides))
+    return [_render(prs, slides[i], width) for i in indexes]
+
+
 def render_presentation(pptx, output_dir, width=1920):
     """Save every slide as ``slide_<n>.png`` in ``output_dir``; returns the file paths."""
     prs = pptx if hasattr(pptx, "slides") else Presentation(pptx)
