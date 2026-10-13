@@ -572,6 +572,68 @@ def _draw_picture(canvas, shape, box):
     canvas.paste_rotated(img, box, getattr(shape, "rotation", 0))
 
 
+def _preset_geometry(shape):
+    """Return (preset name, {adjustment name: value}) from the shape's XML."""
+    ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    try:
+        geom = shape._element.spPr.find(ns + "prstGeom")
+    except Exception:
+        return None, {}
+    if geom is None:
+        return None, {}
+    adj = {}
+    for gd in geom.iter(ns + "gd"):
+        fmla = gd.get("fmla", "")
+        if fmla.startswith("val "):
+            try:
+                adj[gd.get("name")] = int(fmla[4:])
+            except ValueError:
+                pass
+    return geom.get("prst"), adj
+
+
+def _preset_polygon(prst, adj, w, h):
+    """Polygon points for supported preset shapes (following the OOXML preset definitions)."""
+    ss = min(w, h)
+    a = lambda n, d: adj.get(n, d) / 100000.0
+
+    def arrow_right(width, height, shaft, head, both=False):
+        # horizontal arrow(s) in a width x height box
+        s = height * min(max(shaft, 0), 1)
+        y0, y1 = (height - s) / 2, (height + s) / 2
+        dx = min(min(width, height) * head, width / 2 if both else width)
+        if both:
+            return [(0, height / 2), (dx, 0), (dx, y0), (width - dx, y0), (width - dx, 0),
+                    (width, height / 2), (width - dx, height), (width - dx, y1), (dx, y1), (dx, height)]
+        return [(0, y0), (width - dx, y0), (width - dx, 0), (width, height / 2),
+                (width - dx, height), (width - dx, y1), (0, y1)]
+
+    if prst == "rightArrow":
+        return arrow_right(w, h, a("adj1", 50000), a("adj2", 50000))
+    if prst == "leftArrow":
+        return [(w - x, y) for x, y in arrow_right(w, h, a("adj1", 50000), a("adj2", 50000))]
+    if prst == "downArrow":
+        return [(y, x) for x, y in arrow_right(h, w, a("adj1", 50000), a("adj2", 50000))]
+    if prst == "upArrow":
+        return [(y, h - x) for x, y in arrow_right(h, w, a("adj1", 50000), a("adj2", 50000))]
+    if prst == "leftRightArrow":
+        return arrow_right(w, h, a("adj1", 50000), a("adj2", 50000), both=True)
+    if prst == "upDownArrow":
+        pts = arrow_right(h, w, a("adj1", 50000), a("adj2", 50000), both=True)
+        return [(y, x) for x, y in pts]
+    if prst == "chevron":
+        x1 = min(ss * a("adj", 50000), w)
+        return [(0, 0), (w - x1, 0), (w, h / 2), (w - x1, h), (0, h), (x1, h / 2)]
+    if prst == "homePlate":
+        x1 = w - min(ss * a("adj", 50000), w)
+        return [(0, 0), (x1, 0), (w, h / 2), (x1, h), (0, h)]
+    if prst == "diamond":
+        return [(w / 2, 0), (w, h / 2), (w / 2, h), (0, h / 2)]
+    if prst == "rtTriangle":
+        return [(0, 0), (w, h), (0, h)]
+    return None
+
+
 def _draw_shape_geometry(canvas, shape, box, fill, line, line_w):
     from pptx.enum.shapes import MSO_SHAPE
     layer = Image.new("RGBA", (max(round(box[2] - box[0]), 1), max(round(box[3] - box[1]), 1)), (0, 0, 0, 0))
@@ -583,7 +645,16 @@ def _draw_shape_geometry(canvas, shape, box, fill, line, line_w):
     except Exception:
         pass
     kw = dict(fill=fill, outline=line, width=line_w)
-    if kind == MSO_SHAPE.OVAL:
+    prst, adj = _preset_geometry(shape)
+    poly = _preset_polygon(prst, adj, rect[2], rect[3])
+    if poly is not None:
+        xfrm = shape._element.spPr.find("{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm")
+        if xfrm is not None and xfrm.get("flipH") in ("1", "true"):
+            poly = [(rect[2] - x, y) for x, y in poly]
+        if xfrm is not None and xfrm.get("flipV") in ("1", "true"):
+            poly = [(x, rect[3] - y) for x, y in poly]
+        d.polygon(poly, **kw)
+    elif kind == MSO_SHAPE.OVAL:
         d.ellipse(rect, **kw)
     elif kind == MSO_SHAPE.ROUNDED_RECTANGLE:
         d.rounded_rectangle(rect, radius=min(layer.size) // 6, **kw)
