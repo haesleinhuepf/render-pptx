@@ -134,6 +134,26 @@ def test_theme_text_color(tmp_path):
                for y in range(img.height) for x in range(img.width))
 
 
+def test_theme_text_color_tint(tmp_path):
+    from lxml import etree
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    run = tb.text_frame.paragraphs[0].add_run()
+    run.text = "X"
+    run.font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
+    color = run._r.rPr.find("{%s}solidFill/{%s}schemeClr" % (ns, ns))
+    etree.SubElement(color, "{%s}tint" % ns, val="50000")
+    path = tmp_path / "theme-color-tint.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    pixels = img.load()
+    assert any(pixels[x, y] == (167, 192, 222)
+               for y in range(img.height) for x in range(img.width))
+
+
 def test_inherited_theme_text_color(tmp_path):
     from lxml import etree
     ns = "http://schemas.openxmlformats.org/drawingml/2006/main"

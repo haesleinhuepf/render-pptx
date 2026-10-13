@@ -367,15 +367,9 @@ def _run_color(canvas, shape, para, run, default_color):
         solid_fill = el.find("a:solidFill", _NS)
         if solid_fill is None or len(solid_fill) == 0:
             continue
-        color = solid_fill[0]
-        value = color.get("lastClr") if color.tag == _A_NS + "sysClr" else color.get("val")
-        if not value:
-            continue
-        if color.tag == _A_NS + "schemeClr":
-            key = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}.get(value, value)
-            return canvas.theme_colors.get(key, default_color)
-        if color.tag in (_A_NS + "srgbClr", _A_NS + "sysClr"):
-            return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+        color = _xml_color(solid_fill[0], canvas.theme_colors)
+        if color is not None:
+            return color[:3]
     return default_color
 
 
