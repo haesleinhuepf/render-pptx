@@ -1,4 +1,5 @@
 """Render pptx slides onto a PIL canvas."""
+import copy
 import io
 import math
 import os
@@ -307,6 +308,14 @@ def _style_sources(canvas, shape, level, leaf="a:defRPr"):
             break
         yield from lst(cur._element.find("{http://schemas.openxmlformats.org/presentationml/2006/main}txBody"))
         cur = getattr(cur, "_base_placeholder", None) if cur.is_placeholder else None
+    if shape is not None and leaf == "a:defRPr":
+        # the shape style's fontRef color outranks master/default text styles
+        ref = shape._element.find("{http://schemas.openxmlformats.org/presentationml/2006/main}style/a:fontRef", _NS)
+        if ref is not None and len(ref):
+            from lxml import etree
+            rpr = etree.Element(_A_NS + "defRPr")
+            etree.SubElement(rpr, _A_NS + "solidFill").append(copy.deepcopy(ref[0]))
+            yield rpr
     master = canvas.master
     if master is not None:
         styles = master._element.xpath("p:txStyles/p:%sStyle" % kind)

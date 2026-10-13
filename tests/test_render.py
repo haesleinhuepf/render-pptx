@@ -154,6 +154,20 @@ def test_theme_text_color_tint(tmp_path):
                for y in range(img.height) for x in range(img.width))
 
 
+def test_shape_style_font_color(tmp_path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1), Inches(1), Inches(4), Inches(2))
+    shape.text_frame.text = "X"  # autoshape style's fontRef is lt1 (white), no explicit run color
+    path = tmp_path / "shape-font-ref.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    inside = [img.getpixel((x, y)) for x in range(80, 400) for y in range(80, 200)]
+    assert (255, 255, 255) in inside
+    assert (0, 0, 0) not in inside
+
+
 def test_inherited_theme_text_color(tmp_path):
     from lxml import etree
     ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
