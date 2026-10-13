@@ -54,6 +54,81 @@ def _font(size, bold=False, name=None, italic=False):
     return ImageFont.load_default(size)
 
 
+_EMOJI_FONTS = ["seguiemj.ttf", "Segoe UI Emoji", "NotoColorEmoji.ttf",
+                "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+                "/System/Library/Fonts/Apple Color Emoji.ttc", "Apple Color Emoji.ttc",
+                "NotoEmoji-Regular.ttf", "DejaVuSans.ttf"]
+_EMOJI_RE = re.compile("([\u2190-\u21ff\u2300-\u23ff\u2600-\u27bf\u2900-\u297f\u2b00-\u2bff"
+                       "\u3030\u303d\u3297\u3299\U0001f000-\U0001faff\ufe0f\u200d\u20e3]+)")
+_emoji_fonts = {}
+
+
+def _emoji_font(size):
+    """Font used for emoji; None if no emoji-capable font is available."""
+    if size not in _emoji_fonts:
+        found = None
+        for cand in _EMOJI_FONTS:
+            for s in ([size] if cand != "NotoColorEmoji.ttf" and "Noto" not in cand else [109]):
+                try:
+                    found = ImageFont.truetype(cand, s)
+                    break
+                except OSError:
+                    continue
+            if found:
+                break
+        _emoji_fonts[size] = found
+    return _emoji_fonts[size]
+
+
+def _segments(text, font):
+    """Split text into (segment, font, is_emoji) so emoji use an emoji-capable font."""
+    out = []
+    for i, part in enumerate(_EMOJI_RE.split(text)):
+        if not part:
+            continue
+        ef = _emoji_font(int(font.size)) if i % 2 else None
+        out.append((part, ef, True) if ef else (part, font, False))
+    return out
+
+
+def _emoji_scale(ef, font):
+    return font.size / ef.size if ef.size > font.size * 2 else 1.0
+
+
+def _tlen(draw, text, font):
+    """Text width, accounting for emoji fallback fonts."""
+    total = 0.0
+    for seg, f, emoji in _segments(text, font):
+        w = draw.textlength(seg, font=f)
+        total += w * _emoji_scale(f, font) if emoji else w
+    return total
+
+
+def _draw_run(img, draw, xy, text, font, fill):
+    """Draw text, rendering emoji runs with an emoji font (scaled bitmap fonts included)."""
+    x, y = xy
+    for seg, f, emoji in _segments(text, font):
+        if not emoji:
+            draw.text((x, y), seg, font=f, fill=fill)
+            x += draw.textlength(seg, font=f)
+            continue
+        scale = _emoji_scale(f, font)
+        w = draw.textlength(seg, font=f)
+        if scale == 1.0:
+            try:
+                draw.text((x, y), seg, font=f, fill=fill, embedded_color=True)
+            except (OSError, ValueError):
+                draw.text((x, y), seg, font=f, fill=fill)
+        else:
+            asc, desc = f.getmetrics()
+            tile = Image.new("RGBA", (max(int(w) + 1, 1), asc + desc + 1), (0, 0, 0, 0))
+            ImageDraw.Draw(tile).text((0, 0), seg, font=f, embedded_color=True)
+            tile = tile.resize((max(round(tile.width * scale), 1), max(round(tile.height * scale), 1)),
+                               Image.LANCZOS)
+            img.paste(tile, (round(x), round(y)), tile)
+        x += w * scale
+
+
 _THEME_COLOR_KEYS = {
     "DARK_1": "dk1", "LIGHT_1": "lt1", "DARK_2": "dk2", "LIGHT_2": "lt2",
     "TEXT_1": "dk1", "BACKGROUND_1": "lt1", "TEXT_2": "dk2", "BACKGROUND_2": "lt2",
@@ -321,13 +396,13 @@ def _layout_line(draw, tokens, canvas, stops, default_tab, start=0.0):
                 for t, f, _c, _s, _u in tokens[i + 1:]:
                     if t == "\t":
                         break
-                    seg += draw.textlength(t, font=f)
+                    seg += _tlen(draw, t, f)
                 x = max(pos - (seg / 2 if align == "ctr" else seg), x)
             else:
                 x = pos
         else:
             placed.append((x, text, font, color, ul))
-            x += draw.textlength(text, font=font)
+            x += _tlen(draw, text, font)
         i += 1
     return placed, x
 
@@ -478,7 +553,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
                 line_no += 1
                 placed, width = _layout_line(draw, cur, canvas, stops, default_tab, start)
                 width = max(
-                    (x + draw.textlength(t.rstrip(" "), font=f) for x, t, f, _c, _u in placed), default=0)
+                    (x + _tlen(draw, t.rstrip(" "), f) for x, t, f, _c, _u in placed), default=0)
                 lines.append((placed, width, align, max(t[3] for t in cur) * 1.2))
             cur = []
 
@@ -493,7 +568,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
             if text != "\t" and cur:
                 start = first_start if line_no == 0 else rest_start
                 _p, cur_w = _layout_line(draw, cur, canvas, stops, default_tab, start)
-                if cur_w + draw.textlength(text.rstrip(" "), font=font) > avail:
+                if cur_w + _tlen(draw, text.rstrip(" "), font) > avail:
                     flush()
             cur.append(tok)
         flush()
@@ -515,11 +590,11 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
             shift = avail - line_w
         for x, text, font, color, ul in placed:
             tx, shown = x0 + pad_l + shift + x, text.rstrip(" ")
-            draw.text((tx, y), shown, font=font, fill=color)
+            _draw_run(target, draw, (tx, y), shown, font, color)
             if ul and shown:
                 asc, _desc = font.getmetrics()
                 uy = y + asc + max(font.size * 0.08, 1)
-                draw.line([(tx, uy), (tx + draw.textlength(shown, font=font), uy)],
+                draw.line([(tx, uy), (tx + _tlen(draw, shown, font), uy)],
                           fill=color, width=max(round(font.size / 14), 1))
         y += h
 
