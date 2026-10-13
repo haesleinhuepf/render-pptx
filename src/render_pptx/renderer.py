@@ -118,6 +118,7 @@ class _Canvas:
         self.prs = self.master = None
         self.theme_fonts = {}
         self.theme_colors = {}
+        self.theme_lines = []
         self.table_styles = {}
         self.default_table_style = None
 
@@ -584,12 +585,141 @@ def _shade(color, mode):
     return tuple(rgb) + tuple(color[3:])
 
 
-def _draw_shape_geometry(canvas, shape, box, fill, line, line_w):
-    from . import geometry
+def _theme_lines(master):
+    """Return the theme's line styles (a:ln elements of fmtScheme/lnStyleLst)."""
+    try:
+        from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+        from lxml import etree
+        theme = etree.fromstring(master.part.part_related_by(RT.THEME).blob)
+        return list(theme.find(".//a:fmtScheme/a:lnStyleLst", _NS))
+    except Exception:
+        return []
+
+
+_P_STYLE = "{http://schemas.openxmlformats.org/presentationml/2006/main}style"
+_JOINS = {"round": "round", "bevel": "bevel", "miter": "miter"}
+
+
+def _shape_line(canvas, shape):
+    """Resolved outline of a shape: dict(color, width, dash, cap, join, miter, head, tail) or None."""
+    from .lines import DASHES
+    el = shape._element
+    sppr = getattr(el, "spPr", None)
+    if sppr is None:
+        return None
+    ln = sppr.find(_A_NS + "ln")
+    style = el.find(_P_STYLE)
+    ref = style.find(_A_NS + "lnRef") if style is not None else None
+    idx = int(ref.get("idx", "0")) if ref is not None else 0
+    theme_ln = canvas.theme_lines[idx - 1] if 1 <= idx <= len(canvas.theme_lines) else None
+    sources = [s for s in (ln, theme_ln) if s is not None]
+    if ln is not None and ln.find(_A_NS + "noFill") is not None:
+        return None
+
+    color = None
+    fill_el = None
+    if ln is not None:
+        for tag in ("solidFill", "gradFill", "pattFill"):
+            fill_el = ln.find(_A_NS + tag)
+            if fill_el is not None:
+                fill_tag = tag
+                break
+    if fill_el is not None:
+        if fill_tag == "gradFill":
+            fill_el = fill_el.find(_A_NS + "gsLst/" + _A_NS + "gs")
+        elif fill_tag == "pattFill":
+            fill_el = fill_el.find(_A_NS + "fgClr")
+        if fill_el is not None and len(fill_el):
+            color = _xml_color(fill_el[0], canvas.theme_colors)
+    elif ref is not None and idx > 0 and len(ref):
+        color = _xml_color(ref[0], canvas.theme_colors)
+    if color is None:
+        return None
+
+    def attr(name):
+        for s in sources:
+            if s.get(name) is not None:
+                return s.get(name)
+        return None
+
+    def child(tag):
+        for s in sources:
+            c = s.find(_A_NS + tag)
+            if c is not None:
+                return c
+        return None
+
+    width = max(canvas.px(int(attr("w") or 12700)), 1.0)
+    dash = None
+    pd = child("prstDash")
+    cd = child("custDash")
+    if pd is not None:
+        dash = DASHES.get(pd.get("val"))
+    elif cd is not None:
+        vals = []
+        for ds in cd:
+            vals += [int(ds.get("d", "100000")) / 100000.0, int(ds.get("sp", "100000")) / 100000.0]
+        dash = tuple(vals) or None
+    join, miter = "round", 8.0
+    for s in sources:
+        found = [c for c in s if c.tag.rsplit("}", 1)[-1] in _JOINS]
+        if found:
+            join = _JOINS[found[0].tag.rsplit("}", 1)[-1]]
+            miter = int(found[0].get("lim", "800000")) / 100000.0
+            break
+    head = tail = None
+    for tag in ("headEnd", "tailEnd"):
+        end = ln.find(_A_NS + tag) if ln is not None else None
+        if end is not None and end.get("type", "none") != "none":
+            info = (end.get("type"), {"sm": 2, "med": 3, "lg": 5}.get(end.get("w", "med"), 3))
+            if tag == "headEnd":
+                head = info
+            else:
+                tail = info
+    return {"color": color, "width": width, "dash": dash,
+            "cap": {"rnd": "rnd", "sq": "sq"}.get(attr("cap"), "flat"),
+            "join": join, "miter": miter, "head": head, "tail": tail}
+
+
+def _arrow_ref(pts, i, dist):
+    """First point at least ``dist`` away from pts[i] (to get a stable arrow direction)."""
+    base = pts[i]
+    for p in pts[i + 1:]:
+        if math.hypot(p[0] - base[0], p[1] - base[1]) >= dist:
+            return p
+    return pts[-1]
+
+
+def _trim_polyline(pts, dist):
+    """Drop ``dist`` of length from the start of a polyline."""
+    left = dist
+    for i in range(len(pts) - 1):
+        seg = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        if seg > left:
+            t = left / seg if seg else 0
+            start = (pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t)
+            return [start] + pts[i + 1:]
+        left -= seg
+    return pts
+
+
+def _trim_for_arrows(pts, width, head, tail):
+    """Shorten the stroked body at arrow ends so its thickness doesn't poke out past the tip."""
+    cut = width * 1.5
+    if head:
+        pts = _trim_polyline(pts, cut)
+    if tail:
+        pts = _trim_polyline(pts[::-1], cut)[::-1]
+    return pts
+
+
+def _draw_shape_geometry(canvas, shape, box, fill, line):
+    from . import geometry, lines
     ss = 2
     bw, bh = max(round(box[2] - box[0]), 1), max(round(box[3] - box[1]), 1)
-    inset = line_w * ss / 2.0 if line else 0.0
-    w, h = bw * ss - 2 * inset, bh * ss - 2 * inset
+    line_w = line["width"] if line else 0
+    inset = 0.0
+    w, h = bw * ss, bh * ss
     geom, overrides = geometry.shape_geometry(shape)
     paths = geometry.evaluate(geom, w, h, overrides) if geom is not None else None
     if not paths:
@@ -605,8 +735,9 @@ def _draw_shape_geometry(canvas, shape, box, fill, line, line_w):
     # callout tails etc. may extend beyond the shape box: pad symmetrically so rotation stays centred
     xs = [x for subs in placed for pts, _ in subs for x, _ in pts] or [0]
     ys = [y for subs in placed for pts, _ in subs for _, y in pts] or [0]
-    over_x = max(0.0, -min(xs), max(xs) - bw * ss) + line_w * ss
-    over_y = max(0.0, -min(ys), max(ys) - bh * ss) + line_w * ss
+    reach = line_w * ss * (min(line["miter"], 6.0) if line and line["join"] == "miter" else 1.0)
+    over_x = max(0.0, -min(xs), max(xs) - bw * ss) + reach
+    over_y = max(0.0, -min(ys), max(ys) - bh * ss) + reach
     pad_x, pad_y = math.ceil(over_x / ss), math.ceil(over_y / ss)
     layer = Image.new("RGBA", ((bw + 2 * pad_x) * ss, (bh + 2 * pad_y) * ss), (0, 0, 0, 0))
     off = (pad_x * ss, pad_y * ss)
@@ -624,9 +755,21 @@ def _draw_shape_geometry(canvas, shape, box, fill, line, line_w):
                     mask = ImageChops.logical_xor(mask, tmp)
             layer.paste(_shade(fill, path["fill"]), mask=mask)
         if line and path["stroke"]:
-            d = ImageDraw.Draw(layer)
             for pts, closed in subs:
-                d.line(pts + [pts[0]] if closed else pts, fill=line, width=max(line_w * ss, 1), joint="curve")
+                if len(pts) < 2:
+                    continue
+                head = None if closed else line["head"]
+                tail = None if closed else line["tail"]
+                body = _trim_for_arrows(pts, line_w * ss, head, tail)
+                lines.stroke(layer, body, closed, line["color"], line_w * ss, line["dash"],
+                             line["cap"], line["join"], line["miter"])
+                d = ImageDraw.Draw(layer)
+                if head:
+                    _draw_arrow_head(d, pts[0], _arrow_ref(pts, 0, line_w * ss), head[0], head[1],
+                                     line_w * ss, line["color"])
+                if tail:
+                    _draw_arrow_head(d, pts[-1], _arrow_ref(pts[::-1], 0, line_w * ss), tail[0], tail[1],
+                                     line_w * ss, line["color"])
     layer = layer.resize((bw + 2 * pad_x, bh + 2 * pad_y), Image.LANCZOS)
     canvas.paste_rotated(layer, box, getattr(shape, "rotation", 0))
 
@@ -745,31 +888,6 @@ def _draw_shapes(canvas, shapes, ox=0, oy=0, sx=1.0, sy=1.0, skip_placeholders=F
 
 
 _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
-# dash pattern as (dash, gap) in multiples of line width
-_DASHES = {
-    "dot": (1, 2), "sysDot": (1, 1), "dash": (4, 3), "sysDash": (3, 1),
-    "lgDash": (8, 3), "dashDot": (4, 3, 1, 3), "sysDashDot": (3, 1, 1, 1),
-    "lgDashDot": (8, 3, 1, 3), "lgDashDotDot": (8, 3, 1, 3, 1, 3),
-    "sysDashDotDot": (3, 1, 1, 1, 1, 1),
-}
-
-
-def _draw_dashed(draw, p0, p1, pattern, width, fill):
-    import math
-    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-    length = math.hypot(dx, dy)
-    if length == 0:
-        return
-    ux, uy = dx / length, dy / length
-    pos, i = 0.0, 0
-    while pos < length:
-        seg = max(pattern[i % len(pattern)] * width, 1)
-        if i % 2 == 0:
-            end = min(pos + seg, length)
-            draw.line((p0[0] + ux * pos, p0[1] + uy * pos, p0[0] + ux * end, p0[1] + uy * end),
-                      fill=fill, width=width)
-        pos += seg
-        i += 1
 
 
 def _draw_arrow_head(draw, tip, frm, kind, size_w, width, fill):
@@ -806,8 +924,11 @@ def _draw_arrow_head(draw, tip, frm, kind, size_w, width, fill):
 
 def _draw_line_shape(canvas, shape, box):
     import math
-    color = _rgb(shape.line.color, canvas.theme_colors) or (0, 0, 0)
-    width = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
+    from . import lines
+    info = _shape_line(canvas, shape) or {"color": (0, 0, 0, 255), "width": 1.0, "dash": None, "cap": "flat",
+                                          "head": None, "tail": None}
+    color = info["color"]
+    width = max(round(info["width"]), 1)
     xfrm = shape._element.spPr.find(_A_NS + "xfrm")
     flip_h = flip_v = False
     rot = 0.0
@@ -824,22 +945,7 @@ def _draw_line_shape(canvas, shape, box):
         for p in (p0, p1):
             rx, ry = p[0] - cx, p[1] - cy
             p[0], p[1] = cx + rx * c - ry * s, cy + rx * s + ry * c
-    ln = shape._element.spPr.find(_A_NS + "ln")
-    dash = None
-    head = tail = None
-    if ln is not None:
-        pd = ln.find(_A_NS + "prstDash")
-        if pd is not None:
-            dash = _DASHES.get(pd.get("val"))
-        for tag in ("headEnd", "tailEnd"):
-            el = ln.find(_A_NS + tag)
-            if el is not None and el.get("type", "none") != "none":
-                info = (el.get("type"), {"sm": 2, "med": 3, "lg": 5}.get(el.get("w", "med"), 3))
-                if tag == "headEnd":
-                    head = info
-                else:
-                    tail = info
-    draw = ImageDraw.Draw(canvas.image)
+    dash, head, tail = info["dash"], info["head"], info["tail"]
     a, b = tuple(p0), tuple(p1)
     length = math.hypot(b[0] - a[0], b[1] - a[1])
     # shorten the line at arrow ends so its thickness doesn't poke out past the tip
@@ -851,15 +957,22 @@ def _draw_line_shape(canvas, shape, box):
         if cut_a + cut_b < length:
             la = (a[0] + ux * cut_a, a[1] + uy * cut_a)
             lb = (b[0] - ux * cut_b, b[1] - uy * cut_b)
-    if dash:
-        _draw_dashed(draw, la, lb, dash, width, color)
-    else:
-        draw.line((la[0], la[1], lb[0], lb[1]), fill=color, width=width)
+    pad = int(width * 2 + 2)
+    lx0, ly0 = int(min(a[0], b[0])) - pad, int(min(a[1], b[1])) - pad
+    layer = Image.new("RGBA", (int(abs(b[0] - a[0])) + 2 * pad + 2, int(abs(b[1] - a[1])) + 2 * pad + 2), (0, 0, 0, 0))
+    ss = 2
+    big = layer.resize((layer.width * ss, layer.height * ss))
+    loc = lambda p: ((p[0] - lx0) * ss, (p[1] - ly0) * ss)
+    lines.stroke(big, [loc(la), loc(lb)], False, color, info["width"] * ss if info["width"] >= 1 else ss,
+                 dash, info["cap"])
     if length:
+        d = ImageDraw.Draw(big)
         if head:
-            _draw_arrow_head(draw, a, b, head[0], head[1], width, color)
+            _draw_arrow_head(d, loc(a), loc(b), head[0], head[1], width * ss, color)
         if tail:
-            _draw_arrow_head(draw, b, a, tail[0], tail[1], width, color)
+            _draw_arrow_head(d, loc(b), loc(a), tail[0], tail[1], width * ss, color)
+    layer = big.resize(layer.size, Image.LANCZOS)
+    canvas.image.paste(layer, (lx0, ly0), layer)
 
 
 def _draw_shape(canvas, shape, ox, oy, sx, sy):
@@ -884,23 +997,31 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
         _draw_table(canvas, shape, box)
         return
     if st == MSO_SHAPE_TYPE.LINE or shape.__class__.__name__ == "Connector":
-        _draw_line_shape(canvas, shape, box)
+        from . import geometry
+        geom_el = geometry.shape_geometry(shape)[0]
+        prst = None
+        try:
+            prst = shape._element.spPr.find(_A_NS + "prstGeom").get("prst")
+        except AttributeError:
+            pass
+        if geom_el is None or prst in (None, "line", "straightConnector1"):
+            _draw_line_shape(canvas, shape, box)
+            return
+        line = _shape_line(canvas, shape)
+        if line:
+            _draw_shape_geometry(canvas, shape, box, None, line)
         return
-    fill = line = None
-    line_w = 0
+    fill = None
     try:
         sppr = shape._element.spPr
         fill = _shape_fill(shape, canvas.theme_colors)
         if fill is None and shape.fill.type is not None:
             fill = _with_alpha(_fill_color(shape.fill, canvas.theme_colors), _alpha(sppr))
-        if shape.line.fill.type == MSO_FILL.SOLID:
-            ln = sppr.find("{http://schemas.openxmlformats.org/drawingml/2006/main}ln")
-            line = _with_alpha(_rgb(shape.line.color, canvas.theme_colors), _alpha(ln) if ln is not None else 255)
-            line_w = max(round(canvas.px(shape.line.width or Emu(12700))), 1)
     except Exception:
         pass
+    line = _shape_line(canvas, shape)
     if fill or line:
-        _draw_shape_geometry(canvas, shape, box, fill, line, line_w)
+        _draw_shape_geometry(canvas, shape, box, fill, line)
     if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
         _draw_text(canvas, shape.text_frame, box,
                    rotation=_text_rotation(getattr(shape, "rotation", 0), shape.text_frame), shape=shape)
@@ -924,6 +1045,7 @@ def _render(prs, slide, width):
     canvas.master = slide.slide_layout.slide_master
     canvas.theme_fonts = _theme_fonts(canvas.master)
     canvas.theme_colors = _theme_colors(canvas.master)
+    canvas.theme_lines = _theme_lines(canvas.master)
     canvas.table_styles, canvas.default_table_style = _table_styles(prs)
     _background(canvas, slide)
     layout = slide.slide_layout

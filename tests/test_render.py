@@ -314,3 +314,26 @@ def render_slide_from(prs, tmp_path):
     path = tmp_path / "s.pptx"
     prs.save(path)
     return render_slide(path, 0, 1000).convert("RGB")
+
+
+def test_outline_color_weight_and_dash(tmp_path):
+    from pptx.enum.dml import MSO_LINE
+    from pptx.util import Pt
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1), Inches(1), Inches(4), Inches(2))
+    shape.fill.background()
+    shape.line.color.rgb = RGBColor(255, 0, 0)
+    shape.line.width = Pt(6)
+    shape.line.dash_style = MSO_LINE.DASH
+    img = render_slide_from(prs, tmp_path)
+    scale = img.width / prs.slide_width
+    y = round(Inches(1) * scale)
+    row = [img.getpixel((x, y)) for x in range(round(Inches(1) * scale) + 12, round(Inches(5) * scale) - 12)]
+    red = [px == (255, 0, 0) for px in row]
+    assert any(red) and not all(red)  # dashes with gaps
+    assert all(px in ((255, 0, 0), (255, 255, 255)) or px[1] == px[2] for px in row)
+    # thick line: pixels well above the nominal edge are still red inside a dash
+    x_dash = next(x for x, r in zip(range(round(Inches(1) * scale) + 12, 10 ** 6), red) if r)
+    px = img.getpixel((x_dash, y - 3))
+    assert px[0] == 255 and px[1] < 30
