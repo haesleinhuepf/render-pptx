@@ -20,3 +20,6 @@ render-pptx = "render_pptx.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+render_pptx = ["data/*.xml"]

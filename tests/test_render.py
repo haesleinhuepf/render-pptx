@@ -295,3 +295,22 @@ def test_table_style_uses_declared_theme_color(tmp_path):
     from render_pptx.renderer import _theme_colors
     theme = _theme_colors(Presentation(path).slide_masters[0])
     assert img.getpixel((144, 144)) == theme["accent4"]
+
+
+def test_preset_shapes_are_not_boxes(tmp_path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    for kind in (MSO_SHAPE.RIGHT_ARROW, MSO_SHAPE.DONUT, MSO_SHAPE.UP_ARROW):
+        slide.shapes.add_shape(kind, Inches(1), Inches(1), Inches(2), Inches(2))
+        img = render_slide_from(prs, tmp_path)
+        w, h = img.size
+        # corners of the shape's bounding box stay empty for arrows/donuts; donut centre is a hole
+        x0, y0 = int(w * 1 / 10), int(h * 1 / 7.5)
+        assert img.getpixel((x0 + 2, y0 + 2)) == (255, 255, 255)
+        slide.shapes._spTree.remove(slide.shapes[-1]._element)
+
+
+def render_slide_from(prs, tmp_path):
+    path = tmp_path / "s.pptx"
+    prs.save(path)
+    return render_slide(path, 0, 1000).convert("RGB")
