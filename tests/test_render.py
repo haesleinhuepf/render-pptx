@@ -40,6 +40,82 @@ def test_shape_and_cropped_picture(tmp_path):
     assert img.getpixel((900, 700)) == (255, 255, 255)
 
 
+def _set_gradient_stops(grad_fill, colors):
+    from lxml import etree
+
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    gs_list = grad_fill.find("{%s}gsLst" % ns)
+    for stop in list(gs_list):
+        gs_list.remove(stop)
+    for i, color in enumerate(colors):
+        stop = etree.SubElement(
+            gs_list, "{%s}gs" % ns, pos=str(i * 100000 // (len(colors) - 1)))
+        etree.SubElement(stop, "{%s}srgbClr" % ns, val=color)
+    grad_fill.find("{%s}lin" % ns).set("ang", "0")
+
+
+def test_shape_linear_gradient_uses_all_stops(tmp_path):
+    from pptx.enum.shapes import MSO_SHAPE
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE, Inches(1), Inches(1), Inches(2), Inches(1))
+    shape.fill.gradient()
+    _set_gradient_stops(shape._element.spPr.find(
+        "{http://schemas.openxmlformats.org/drawingml/2006/main}gradFill"),
+        ("ff0000", "00ff00", "0000ff"))
+    path = tmp_path / "shape-gradient.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    assert img.getpixel((80, 108))[0] > 220
+    assert img.getpixel((144, 108))[1] > 220
+    assert img.getpixel((208, 108))[2] > 220
+
+
+def test_gradient_stop_saturation_modifier():
+    from lxml import etree
+    from render_pptx.renderer import _xml_color
+
+    color = etree.fromstring(
+        b'<a:srgbClr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        b'val="8080c0"><a:satMod val="200000"/></a:srgbClr>')
+    assert _xml_color(color, {}) == (96, 96, 224, 255)
+
+
+def test_background_linear_gradient(tmp_path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.background.fill.gradient()
+    grad_fill = slide._element.cSld.bg.bgPr.find(
+        "{http://schemas.openxmlformats.org/drawingml/2006/main}gradFill")
+    _set_gradient_stops(grad_fill, ("ff0000", "0000ff"))
+    path = tmp_path / "background-gradient.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    assert img.getpixel((40, 375))[0] > 220
+    assert img.getpixel((680, 375))[2] > 220
+
+
+def test_table_cell_linear_gradient(tmp_path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    table = slide.shapes.add_table(
+        1, 1, Inches(1), Inches(1), Inches(2), Inches(2)).table
+    table.cell(0, 0).fill.gradient()
+    grad_fill = table.cell(0, 0)._tc.tcPr.find(
+        "{http://schemas.openxmlformats.org/drawingml/2006/main}gradFill")
+    _set_gradient_stops(grad_fill, ("ff0000", "0000ff"))
+    path = tmp_path / "table-gradient.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=720)
+    assert img.getpixel((80, 144))[0] > 220
+    assert img.getpixel((208, 144))[2] > 220
+
+
 def test_export_png(tmp_path):
     paths = render_presentation(_deck(tmp_path), tmp_path / "out", width=500)
     assert len(paths) == 1 and Image.open(paths[0]).format == "PNG"

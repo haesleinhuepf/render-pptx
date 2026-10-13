@@ -186,6 +186,52 @@ def _with_alpha(color, alpha):
     return None if color is None else (*color[:3], alpha)
 
 
+def _gradient_image(grad_fill, size, theme_colors):
+    """Render a DrawingML linear gradient into an RGBA image."""
+    stops_el = grad_fill.find(_A_NS + "gsLst")
+    line = grad_fill.find(_A_NS + "lin")
+    if stops_el is None or line is None:
+        return None
+
+    stops = []
+    for stop in stops_el.findall(_A_NS + "gs"):
+        if len(stop):
+            color = _xml_color(stop[0], theme_colors)
+            if color is not None:
+                stops.append((int(stop.get("pos", "0")) / 100000, color))
+    if len(stops) < 2:
+        return None
+    stops.sort(key=lambda stop: stop[0])
+
+    width, height = size
+    angle = math.radians(int(line.get("ang", "0")) / 60000)
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    span = abs(cos_a) * max(width - 1, 0) + abs(sin_a) * max(height - 1, 0)
+    bar_width = max(round(span) + 1, 1)
+
+    def color_at(position):
+        if position <= stops[0][0]:
+            return stops[0][1]
+        for (start, first), (end, second) in zip(stops, stops[1:]):
+            if position <= end:
+                ratio = (position - start) / (end - start) if end > start else 1
+                return tuple(round(a + (b - a) * ratio) for a, b in zip(first, second))
+        return stops[-1][1]
+
+    bar = Image.new("RGBA", (bar_width, 1))
+    bar.putdata([color_at(i / (bar_width - 1) if bar_width > 1 else 0)
+                 for i in range(bar_width)])
+
+    scale = (bar_width - 1) / span if span else 0
+    x_scale, y_scale = cos_a * scale, sin_a * scale
+    x_offset = (bar_width - 1) / 2 - x_scale * (width - 1) / 2 - y_scale * (height - 1) / 2
+    return bar.transform(
+        size, Image.Transform.AFFINE,
+        (x_scale, y_scale, x_offset, 0, 0, 0),
+        resample=Image.Resampling.BILINEAR,
+    )
+
+
 class _Canvas:
     def __init__(self, width_emu, height_emu, width_px):
         self.scale = width_px / width_emu
@@ -460,6 +506,9 @@ def _xml_color(el, theme_colors):
             rgb = tuple(c + (1 - c) * v for c in rgb)
         elif name == "shade":
             rgb = tuple(c * v for c in rgb)
+        elif name == "satMod":
+            h, l, s = colorsys.rgb_to_hls(*rgb)
+            rgb = colorsys.hls_to_rgb(h, l, min(max(s * v, 0), 1))
     return (*tuple(round(c * 255) for c in rgb), alpha)
 
 
@@ -476,7 +525,7 @@ def _shape_fill(shape, theme_colors):
         if fill is None:
             continue
         if tag == "a:gradFill":
-            fill = fill.find("a:gsLst/a:gs", _NS)
+            return None
         if fill is not None and len(fill):
             return _xml_color(fill[0], theme_colors)
         return None
@@ -486,6 +535,13 @@ def _shape_fill(shape, theme_colors):
     if ref is not None and ref.get("idx", "0") != "0" and len(ref):
         return _xml_color(ref[0], theme_colors)
     return None
+
+
+def _shape_gradient(shape):
+    try:
+        return shape._element.spPr.find(_A_NS + "gradFill")
+    except AttributeError:
+        return None
 
 
 def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0, shape=None):
@@ -791,7 +847,7 @@ def _trim_for_arrows(pts, width, head, tail):
     return pts
 
 
-def _draw_shape_geometry(canvas, shape, box, fill, line):
+def _draw_shape_geometry(canvas, shape, box, fill, line, gradient_fill=None, theme_colors=None):
     from . import geometry, lines
     ss = 2
     bw, bh = max(round(box[2] - box[0]), 1), max(round(box[3] - box[1]), 1)
@@ -820,10 +876,22 @@ def _draw_shape_geometry(canvas, shape, box, fill, line):
     layer = Image.new("RGBA", ((bw + 2 * pad_x) * ss, (bh + 2 * pad_y) * ss), (0, 0, 0, 0))
     off = (pad_x * ss, pad_y * ss)
     box = (box[0] - pad_x, box[1] - pad_y, box[2] + pad_x, box[3] + pad_y)
+    gradient = None
+    if gradient_fill is not None:
+        gradient = _gradient_image(gradient_fill, (bw * ss, bh * ss), theme_colors or {})
+        if gradient is not None:
+            gradient_layer = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+            gradient_layer.paste(gradient, off)
+            gradient = gradient_layer
+        else:
+            stops = gradient_fill.find(_A_NS + "gsLst")
+            first = stops.find(_A_NS + "gs") if stops is not None else None
+            if first is not None and len(first):
+                fill = _xml_color(first[0], theme_colors or {})
 
     for path, subs in zip(paths, placed):
         subs = [([(x + off[0], y + off[1]) for x, y in pts], closed) for pts, closed in subs]
-        if fill and path["fill"] != "none":
+        if (fill or gradient) and path["fill"] != "none":
             # even-odd fill so that nested sub-paths (e.g. donut) become holes
             mask = Image.new("1", layer.size, 0)
             for pts, _ in subs:
@@ -831,7 +899,7 @@ def _draw_shape_geometry(canvas, shape, box, fill, line):
                     tmp = Image.new("1", layer.size, 0)
                     ImageDraw.Draw(tmp).polygon(pts, fill=1)
                     mask = ImageChops.logical_xor(mask, tmp)
-            layer.paste(_shade(fill, path["fill"]), mask=mask)
+            layer.paste(gradient if gradient else _shade(fill, path["fill"]), mask=mask)
         if line and path["stroke"]:
             for pts, closed in subs:
                 if len(pts) < 2:
@@ -940,12 +1008,22 @@ def _draw_table(canvas, shape, box):
             if tcpr is not None and tcpr.find("a:noFill", _NS) is not None:
                 c = None
             else:
+                gradient_drawn = False
                 solid_fill = tcpr.find("a:solidFill", _NS) if tcpr is not None else None
                 if solid_fill is not None and len(solid_fill):
                     c = _xml_color(solid_fill[0], canvas.theme_colors)
                 else:
-                    c = _fill_color(cell.fill, canvas.theme_colors)
-                    if c is None:
+                    grad_fill = tcpr.find("a:gradFill", _NS) if tcpr is not None else None
+                    gradient = (_gradient_image(
+                        grad_fill, (max(round(cw), 1), max(round(rh), 1)), canvas.theme_colors)
+                        if grad_fill is not None else None)
+                    if gradient is not None:
+                        canvas.image.paste(gradient, (round(x), round(y)), gradient)
+                        gradient_drawn = True
+                        c = None
+                    else:
+                        c = _fill_color(cell.fill, canvas.theme_colors)
+                    if c is None and not gradient_drawn:
                         c = _table_style_fill(
                             style, tbl_pr, ri, ci, len(table.rows), len(table.columns),
                             canvas.theme_colors)
@@ -1089,17 +1167,18 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
         if line:
             _draw_shape_geometry(canvas, shape, box, None, line)
         return
-    fill = None
+    fill = gradient_fill = None
     try:
         sppr = shape._element.spPr
+        gradient_fill = _shape_gradient(shape)
         fill = _shape_fill(shape, canvas.theme_colors)
-        if fill is None and shape.fill.type is not None:
+        if gradient_fill is None and fill is None and shape.fill.type is not None:
             fill = _with_alpha(_fill_color(shape.fill, canvas.theme_colors), _alpha(sppr))
     except Exception:
         pass
     line = _shape_line(canvas, shape)
-    if fill or line:
-        _draw_shape_geometry(canvas, shape, box, fill, line)
+    if fill or gradient_fill is not None or line:
+        _draw_shape_geometry(canvas, shape, box, fill, line, gradient_fill, canvas.theme_colors)
     if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
         _draw_text(canvas, shape.text_frame, box,
                    rotation=_text_rotation(getattr(shape, "rotation", 0), shape.text_frame), shape=shape)
@@ -1109,6 +1188,16 @@ def _background(canvas, slide):
     for obj in (slide, slide.slide_layout, slide.slide_layout.slide_master):
         try:
             fill = obj.background.fill
+            bg = obj._element.cSld.bg
+            bg_pr = bg.bgPr if bg is not None else None
+            grad_fill = bg_pr.find(_A_NS + "gradFill") if bg_pr is not None else None
+            if grad_fill is not None:
+                gradient = _gradient_image(grad_fill, canvas.size, canvas.theme_colors)
+                if gradient is not None:
+                    canvas.image = Image.alpha_composite(
+                        canvas.image.convert("RGBA"), gradient
+                    ).convert("RGB")
+                    return
             c = _fill_color(fill, canvas.theme_colors)
             if c:
                 canvas.image.paste(c, (0, 0, *canvas.size))
