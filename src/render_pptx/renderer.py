@@ -18,13 +18,74 @@ _FONTS_BOLD = ["DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf", "Liberati
 
 
 _font_files = {}
+_installed_fonts = None
+
+
+def _scan_installed_fonts():
+    """Map lower-case 'family [style]' names to font files from the Windows registry and font folders."""
+    global _installed_fonts
+    if _installed_fonts is not None:
+        return _installed_fonts
+    found = {}
+    try:
+        import winreg
+        for hive, base in ((winreg.HKEY_LOCAL_MACHINE, r"C:\Windows\Fonts"),
+                           (winreg.HKEY_CURRENT_USER,
+                            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Microsoft\Windows\Fonts"))):
+            try:
+                with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts") as key:
+                    for i in range(winreg.QueryInfoKey(key)[1]):
+                        value, path, _t = winreg.EnumValue(key, i)
+                        value = re.sub(r"\s*\((TrueType|OpenType)\)$", "", value).split(" & ")[0]
+                        found[value.lower()] = path if os.path.isabs(path) else os.path.join(base, path)
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    cloud = os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Microsoft\FontCache\4\CloudFonts")
+    if os.path.isdir(cloud):
+        for root, _dirs, files in os.walk(cloud):
+            for fn in files:
+                if fn.lower().endswith((".ttf", ".otf")):
+                    path = os.path.join(root, fn)
+                    try:
+                        family, style = ImageFont.truetype(path, 10).getname()
+                    except OSError:
+                        continue
+                    found.setdefault(family.lower() + " " + style.lower(), path)
+                    if style.lower() == "regular":
+                        found.setdefault(family.lower(), path)
+    for folder in [os.environ.get("RENDER_PPTX_FONT_DIR")] + [
+            os.path.join(os.path.dirname(__file__), "fonts")]:
+        if folder and os.path.isdir(folder):
+            for fn in os.listdir(folder):
+                stem, ext = os.path.splitext(fn)
+                if ext.lower() in (".ttf", ".otf", ".ttc"):
+                    found.setdefault(stem.lower().replace("-", " "), os.path.join(folder, fn))
+    _installed_fonts = found
+    return found
+
+
+def _font_file_installed(name, bold, italic):
+    fonts = _scan_installed_fonts()
+    style = " ".join(s for s, on in (("bold", bold), ("italic", italic)) if on)
+    base = name.lower()
+    for key in ([base + " " + style] if style else []) + ([base] if not style else []) + \
+            ([base + " regular"] if not style else []):
+        if key in fonts:
+            return fonts[key]
+    # fall back to the regular face when the requested style is missing
+    return fonts.get(base) or fonts.get(base + " regular")
 
 
 def _font_file(name, bold, italic):
-    """Locate a font file for a family name using fontconfig (cached); None if unavailable."""
+    """Locate a font file for a family name (installed fonts, then fontconfig); None if unavailable."""
     key = (name, bold, italic)
     if key not in _font_files:
-        path = None
+        path = _font_file_installed(name, bold, italic)
+        if path:
+            _font_files[key] = path
+            return path
         pattern = name + (":bold" if bold else "") + (":italic" if italic else "")
         try:
             out = subprocess.run(["fc-match", "-f", "%{family}|%{file}", pattern],
@@ -39,11 +100,32 @@ def _font_file(name, bold, italic):
     return _font_files[key]
 
 
+_SERIF_HINTS = ("serif", "times", "georgia", "garamond", "cambria", "palatino", "book antiqua",
+                "bookman", "century", "merriweather", "playfair", "lora", "baskerville", "didot",
+                "minion", "caslon", "constantia", "rockwell", "slab")
+_MONO_HINTS = ("mono", "code", "courier", "consolas", "menlo", "typewriter", "lucida console")
+_SERIF_FALLBACKS = ["Times New Roman", "Liberation Serif", "DejaVu Serif", "Georgia"]
+_MONO_FALLBACKS = ["Consolas", "Courier New", "Liberation Mono", "DejaVu Sans Mono"]
+
+
+def _similar_fonts(name, bold, italic):
+    """Candidate font files resembling `name` (by serif / monospace / sans category)."""
+    lower = (name or "").lower()
+    if any(h in lower for h in _MONO_HINTS):
+        families = _MONO_FALLBACKS
+    elif any(h in lower for h in _SERIF_HINTS) and "sans" not in lower:
+        families = _SERIF_FALLBACKS
+    else:
+        return []
+    return [_font_file(f, bold, italic) for f in families]
+
+
 def _font(size, bold=False, name=None, italic=False):
     size = max(int(size), 1)
     candidates = []
     if name:
         candidates += [_font_file(name, bold, italic), name + ".ttf"]
+        candidates += _similar_fonts(name, bold, italic)
     candidates += (_FONTS_BOLD if bold else []) + _FONTS
     for cand in candidates:
         if not cand:
