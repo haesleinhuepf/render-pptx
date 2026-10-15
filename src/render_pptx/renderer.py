@@ -132,7 +132,7 @@ def _draw_run(img, draw, xy, text, font, fill):
 
 _THEME_COLOR_KEYS = {
     "DARK_1": "dk1", "LIGHT_1": "lt1", "DARK_2": "dk2", "LIGHT_2": "lt2",
-    "TEXT_1": "dk1", "BACKGROUND_1": "lt1", "TEXT_2": "dk2", "BACKGROUND_2": "lt2",
+    "TEXT_1": "tx1", "BACKGROUND_1": "bg1", "TEXT_2": "tx2", "BACKGROUND_2": "bg2",
     "HYPERLINK": "hlink", "FOLLOWED_HYPERLINK": "folHlink",
     **{"ACCENT_%d" % i: "accent%d" % i for i in range(1, 7)},
 }
@@ -325,8 +325,13 @@ def _theme_colors(master):
             if value:
                 colors[entry.tag.rsplit("}", 1)[-1]] = tuple(
                     int(value[i:i + 2], 16) for i in (0, 2, 4))
-        colors.update({"tx1": colors.get("dk1"), "bg1": colors.get("lt1"),
-                       "tx2": colors.get("dk2"), "bg2": colors.get("lt2")})
+        mapping = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}
+        clr_map = master._element.find("{http://schemas.openxmlformats.org/presentationml/2006/main}clrMap")
+        if clr_map is not None:
+            for key in mapping:
+                if clr_map.get(key):
+                    mapping[key] = clr_map.get(key)
+        colors.update({key: colors.get(target) for key, target in mapping.items()})
         return colors
     except Exception:
         return {}
@@ -479,8 +484,7 @@ def _xml_color(el, theme_colors):
     import colorsys
     value = el.get("lastClr") if el.tag == _A_NS + "sysClr" else el.get("val")
     if el.tag == _A_NS + "schemeClr":
-        key = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}.get(value, value)
-        rgb = theme_colors.get(key)
+        rgb = theme_colors.get(value)
     elif el.tag in (_A_NS + "srgbClr", _A_NS + "sysClr") and value:
         rgb = tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
     else:
@@ -970,7 +974,6 @@ def _table_style_fill(style, tbl_pr, row, col, row_count, col_count, theme_color
     """Return the base RGB color declared for the applicable table-style fill."""
     if style is None:
         return None
-    aliases = {"tx1": "dk1", "bg1": "lt1", "tx2": "dk2", "bg2": "lt2"}
     for name in _table_style_regions(tbl_pr, row, col, row_count, col_count):
         region = style.find("a:" + name + "/a:tcStyle", _NS)
         fill = region.find("a:fill", _NS) if region is not None else None
@@ -979,8 +982,7 @@ def _table_style_fill(style, tbl_pr, row, col, row_count, col_count, theme_color
             continue
         value = color.get("lastClr") if color.tag == _A_NS + "sysClr" else color.get("val")
         if color.tag == _A_NS + "schemeClr":
-            key = aliases.get(value, value)
-            return theme_colors.get(key)
+            return theme_colors.get(value)
         if color.tag in (_A_NS + "srgbClr", _A_NS + "sysClr") and value:
             return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
     return None
