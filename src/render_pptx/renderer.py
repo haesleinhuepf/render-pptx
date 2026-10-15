@@ -471,6 +471,7 @@ class _RunShim:
         self.rPr = el.find("a:rPr", _NS)
         t = el.find("a:t", _NS)
         self.text = (t.text or "") if t is not None else ""
+        self.field_type = el.get("type") if el.tag == _A_NS + "fld" else None
 
 
 def _para_runs(para):
@@ -584,7 +585,10 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
         tokens = []
         for r in _para_runs(para):
             is_br = r._r.tag == _A_NS + "br"
-            if not is_br and not r.text:
+            text = r.text
+            if r.field_type == "slidenum" and getattr(canvas, "slide_number", None):
+                text = str(canvas.slide_number)
+            if not is_br and not text:
                 continue
             size, bold, italic, name = _run_props(canvas, shape, para, r)
             # always render 1pt smaller than specified
@@ -600,7 +604,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
             if is_br:
                 tokens.append(("\n", font, color, fpx, False))
                 continue
-            for tok in _TOKEN_RE.findall(r.text):
+            for tok in _TOKEN_RE.findall(text):
                 tokens.append((tok, font, color, fpx, underline))
         if not tokens:
             h = canvas.px(Emu(127000))
@@ -703,10 +707,37 @@ def _picture_image(shape):
     return out
 
 
+def _apply_duotone(img, shape, theme_colors):
+    """Recolor a picture per a:duotone: luminance 0 maps to the first color, 1 to the second."""
+    try:
+        duotone = shape._element.blipFill.find("a:blip/a:duotone", _NS)
+    except AttributeError:
+        return img
+    if duotone is None or len(duotone) < 2:
+        return img
+    c0 = _xml_color(duotone[0], theme_colors) if duotone[0].tag != _A_NS + "prstClr" else None
+    c1 = _xml_color(duotone[1], theme_colors) if duotone[1].tag != _A_NS + "prstClr" else None
+    preset = {"white": (255, 255, 255, 255), "black": (0, 0, 0, 255)}
+    if c0 is None:
+        c0 = preset.get(duotone[0].get("val"))
+    if c1 is None:
+        c1 = preset.get(duotone[1].get("val"))
+    if c0 is None or c1 is None:
+        return img
+    alpha = img.getchannel("A")
+    gray = img.convert("L")
+    channels = [gray.point([round(c0[i] + (c1[i] - c0[i]) * v / 255) for v in range(256)])
+                for i in range(3)]
+    out = Image.merge("RGB", channels).convert("RGBA")
+    out.putalpha(alpha)
+    return out
+
+
 def _draw_picture(canvas, shape, box):
     img = _picture_image(shape)
     if img is None:
         return
+    img = _apply_duotone(img, shape, canvas.theme_colors)
     bw, bh = max(round(box[2] - box[0]), 1), max(round(box[3] - box[1]), 1)
     img = img.resize((bw, bh), Image.LANCZOS)
     canvas.paste_rotated(img, box, getattr(shape, "rotation", 0))
@@ -1189,6 +1220,14 @@ def _draw_shape(canvas, shape, ox, oy, sx, sy):
 def _background(canvas, slide):
     for obj in (slide, slide.slide_layout, slide.slide_layout.slide_master):
         try:
+            bg_el = obj._element.cSld.bg
+            bg_ref = bg_el.find("{http://schemas.openxmlformats.org/presentationml/2006/main}bgRef") \
+                if bg_el is not None else None
+            if bg_ref is not None and len(bg_ref):
+                color = _xml_color(bg_ref[0], canvas.theme_colors)
+                if color is not None:
+                    canvas.image.paste(color[:3], (0, 0, *canvas.size))
+                    return
             fill = obj.background.fill
             bg = obj._element.cSld.bg
             bg_pr = bg.bgPr if bg is not None else None
@@ -1212,6 +1251,7 @@ def _render(prs, slide, width):
     canvas = _Canvas(prs.slide_width, prs.slide_height, width)
     canvas.prs = prs
     canvas.master = slide.slide_layout.slide_master
+    canvas.slide_number = next((i for i, s in enumerate(prs.slides, 1) if s.slide_id == slide.slide_id), None)
     canvas.theme_fonts = _theme_fonts(canvas.master)
     canvas.theme_colors = _theme_colors(canvas.master)
     canvas.theme_lines = _theme_lines(canvas.master)
