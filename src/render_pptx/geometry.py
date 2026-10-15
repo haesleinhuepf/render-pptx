@@ -204,10 +204,14 @@ def evaluate(geom, w, h, overrides=None):
     guides = _Guides(geom, w, h, overrides or {})
     path_lst = _child(geom, "pathLst")
     result = []
-    for path in (_children(path_lst, "path") if path_lst is not None else []):
+    for path_index, path in enumerate(_children(path_lst, "path") if path_lst is not None else []):
+        stroke = path.get("stroke", "true") not in ("0", "false")
+        if _local(geom) == "cloud" and path_index == 1:
+            # This auxiliary cloud path is made of disconnected accent arcs.
+            stroke = False
         result.append({
             "fill": path.get("fill", "norm"),
-            "stroke": path.get("stroke", "true") not in ("0", "false"),
+            "stroke": stroke,
             "subpaths": _build_path(path, guides, w, h),
         })
     return result

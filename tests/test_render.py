@@ -420,6 +420,19 @@ def test_preset_shapes_are_not_boxes(tmp_path):
         slide.shapes._spTree.remove(slide.shapes[-1]._element)
 
 
+def test_cloud_has_no_detached_accent_strokes():
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.CLOUD, Inches(1), Inches(1), Inches(5), Inches(3))
+    shape.fill.background()
+    shape.line.color.rgb = RGBColor(210, 90, 20)
+
+    img = render_slide(prs, 0, width=720).convert("RGB")
+    assert img.getpixel((196, 99)) == (255, 255, 255)
+    assert img.getpixel((105, 120)) != (255, 255, 255)
+
+
 def render_slide_from(prs, tmp_path):
     path = tmp_path / "s.pptx"
     prs.save(path)
