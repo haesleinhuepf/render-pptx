@@ -458,6 +458,16 @@ def _style_sources(canvas, shape, level, leaf="a:defRPr"):
         yield from canvas.prs._element.xpath("p:defaultTextStyle/" + tag)
 
 
+def _vertical_anchor(text_frame, shape):
+    anchor = text_frame.vertical_anchor
+    current = shape
+    while anchor is None and getattr(current, "is_placeholder", False):
+        current = getattr(current, "_base_placeholder", None)
+        if current is not None:
+            anchor = current.text_frame.vertical_anchor
+    return anchor
+
+
 def _run_props(canvas, shape, para, run):
     """Resolve (size in EMU, bold, italic, font name) of a run, following inheritance."""
     chain = [run._r.rPr] if run._r.rPr is not None else []
@@ -724,7 +734,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
 
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
     total = sum(l[3] for l in lines)
-    anchor = text_frame.vertical_anchor
+    anchor = _vertical_anchor(text_frame, shape)
     inner_h = y1 - y0 - pad_t - pad_b
     y = y0 + pad_t
     if anchor == MSO_ANCHOR.MIDDLE:

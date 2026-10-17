@@ -160,6 +160,24 @@ def test_text_rotation(tmp_path):
     assert max(cols) - min(cols) < 100
 
 
+def test_placeholder_inherits_bottom_vertical_anchor(tmp_path):
+    from pptx.enum.text import MSO_ANCHOR
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title = slide.shapes.title
+    title._base_placeholder.text_frame.vertical_anchor = MSO_ANCHOR.BOTTOM
+    title.text = "Hello"
+    path = tmp_path / "bottom-anchor.pptx"
+    prs.save(path)
+
+    img = render_slide(path, 0, width=1000)
+    dark_rows = [y for y in range(img.height)
+                 if any(img.getpixel((x, y))[0] < 100 for x in range(img.width))]
+    title_midpoint = round((title.top + title.height / 2) / prs.slide_height * img.height)
+    assert dark_rows and min(dark_rows) > title_midpoint
+
+
 def test_indentation_without_tab(tmp_path):
     prs = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[6])
