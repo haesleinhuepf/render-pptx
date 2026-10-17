@@ -386,7 +386,7 @@ def test_table_style_alternating_fills_and_cell_override(tmp_path):
     prs.save(path)
 
     img = render_slide(path, 0, width=720)
-    assert img.getpixel((144, 108)) == (79, 129, 189)
+    assert img.getpixel((144, 108)) == (167, 192, 222)
     assert img.getpixel((144, 180)) == (79, 129, 189)
     assert img.getpixel((144, 252)) == (0, 255, 0)
 

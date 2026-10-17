@@ -600,7 +600,7 @@ def _xml_color(el, theme_colors):
         elif name == "alpha":
             alpha = round(min(max(v, 0), 1) * 255)
         elif name == "tint":
-            rgb = tuple(c + (1 - c) * v for c in rgb)
+            rgb = tuple(1 - (1 - c) * v for c in rgb)
         elif name == "shade":
             rgb = tuple(c * v for c in rgb)
         elif name == "satMod":
@@ -641,20 +641,20 @@ def _shape_gradient(shape):
         return None
 
 
-def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0, shape=None):
+def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0, shape=None, anchor=None):
     if rotation:
         # draw on a padded transparent layer centred on the box, then rotate it onto the canvas
         w, h = box[2] - box[0], box[3] - box[1]
         pad = int(max(w, h))
         layer = Image.new("RGBA", (int(w) + 2 * pad + 1, int(h) + 2 * pad + 1), (0, 0, 0, 0))
         local = (pad, pad, pad + w, pad + h)
-        _render_text(canvas, layer, text_frame, local, default_color, shape)
+        _render_text(canvas, layer, text_frame, local, default_color, shape, anchor=anchor)
         canvas.paste_rotated(layer, box, rotation)
     else:
-        _render_text(canvas, canvas.image, text_frame, box, default_color, shape)
+        _render_text(canvas, canvas.image, text_frame, box, default_color, shape, anchor=anchor)
 
 
-def _render_text(canvas, target, text_frame, box, default_color, shape=None):
+def _render_text(canvas, target, text_frame, box, default_color, shape=None, measure=False, anchor=None):
     x0, y0, x1, y1 = box
     pad_l = canvas.px(text_frame.margin_left)
     pad_r = canvas.px(text_frame.margin_right)
@@ -734,7 +734,9 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None):
 
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
     total = sum(l[3] for l in lines)
-    anchor = _vertical_anchor(text_frame, shape)
+    if measure:
+        return total + pad_t + pad_b
+    anchor = anchor or _vertical_anchor(text_frame, shape)
     inner_h = y1 - y0 - pad_t - pad_b
     y = y0 + pad_t
     if anchor == MSO_ANCHOR.MIDDLE:
@@ -1103,11 +1105,24 @@ def _table_style_fill(style, tbl_pr, row, col, row_count, col_count, theme_color
         color = fill.find("a:solidFill/*", _NS) if fill is not None else None
         if color is None:
             continue
-        value = color.get("lastClr") if color.tag == _A_NS + "sysClr" else color.get("val")
-        if color.tag == _A_NS + "schemeClr":
-            return theme_colors.get(value)
-        if color.tag in (_A_NS + "srgbClr", _A_NS + "sysClr") and value:
-            return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+        return _xml_color(color, theme_colors)
+    return None
+
+
+def _table_style_border(style, regions, side, theme_colors):
+    """Return (RGBA, width in EMU) of the style border for a cell side, or None."""
+    if style is None:
+        return None
+    for name in regions:
+        ln = style.find("a:%s/a:tcStyle/a:tcBdr/a:%s/a:ln" % (name, side), _NS)
+        if ln is None:
+            continue
+        if ln.find("a:noFill", _NS) is not None:
+            return None
+        color = ln.find("a:solidFill/*", _NS)
+        rgba = _xml_color(color, theme_colors) if color is not None else None
+        if rgba is not None:
+            return rgba, int(ln.get("w", "12700"))
     return None
 
 
@@ -1119,9 +1134,21 @@ def _draw_table(canvas, shape, box):
     style = _table_style_for_id(
         style_id, canvas.table_styles, canvas.default_table_style)
     draw = ImageDraw.Draw(canvas.image)
-    y = box[1]
+    row_count, col_count = len(table.rows), len(table.columns)
+    row_heights = []
     for ri, row in enumerate(table.rows):
         rh = canvas.px(row.height)
+        for ci, col in enumerate(table.columns):
+            cell = table.cell(ri, ci)
+            if cell.is_spanned or cell.is_merge_origin:
+                continue
+            rh = max(rh, _render_text(
+                canvas, canvas.image, cell.text_frame,
+                (0, 0, canvas.px(col.width), 0), (0, 0, 0), measure=True))
+        row_heights.append(rh)
+    y = box[1]
+    for ri, row in enumerate(table.rows):
+        rh = row_heights[ri]
         x = box[0]
         for ci, col in enumerate(table.columns):
             cw = canvas.px(col.width)
@@ -1152,8 +1179,19 @@ def _draw_table(canvas, shape, box):
                         c = _table_style_fill(
                             style, tbl_pr, ri, ci, len(table.rows), len(table.columns),
                             canvas.theme_colors)
-            draw.rectangle((x, y, x + cw, y + rh), fill=c, outline=(128, 128, 128))
-            _draw_text(canvas, cell.text_frame, (x, y, x + cw, y + rh))
+            draw.rectangle((x, y, x + cw, y + rh), fill=c)
+            regions = _table_style_regions(tbl_pr, ri, ci, row_count, col_count)
+            edges = (
+                ("left" if ci == 0 else "insideV", (x, y, x, y + rh)),
+                ("right" if ci == col_count - 1 else "insideV", (x + cw, y, x + cw, y + rh)),
+                ("top" if ri == 0 else "insideH", (x, y, x + cw, y)),
+                ("bottom" if ri == row_count - 1 else "insideH", (x, y + rh, x + cw, y + rh)),
+            )
+            for side, xy in edges:
+                border = _table_style_border(style, regions, side, canvas.theme_colors)
+                if border:
+                    draw.line(xy, fill=border[0][:3], width=max(round(canvas.px(border[1])), 1))
+            _draw_text(canvas, cell.text_frame, (x, y, x + cw, y + rh), anchor=cell.vertical_anchor)
             x += cw
         y += rh
 
