@@ -355,16 +355,30 @@ _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 def _para_props(canvas, shape, para):
     """Resolve paragraph properties (inheriting from list styles, layout, master) as a dict:
-    marL, indent (EMU), algn, defTabSz (EMU) and tabs ([(pos_emu, align)] sorted)."""
+    marL, indent (EMU), algn, defTabSz (EMU), tabs ([(pos_emu, align)] sorted) and
+    lnSpc, spcBef, spcAft as ("pct", fraction) or ("pts", EMU)."""
     chain = [para._p.pPr] if para._p.pPr is not None else []
     chain += list(_style_sources(canvas, shape, para.level, None))
-    res = {"marL": 0, "indent": 0, "algn": None, "defTabSz": _DEFAULT_TAB_EMU, "tabs": []}
+    res = {"marL": 0, "indent": 0, "algn": None, "defTabSz": _DEFAULT_TAB_EMU, "tabs": [],
+           "lnSpc": ("pct", 1.0), "spcBef": ("pts", 0), "spcAft": ("pts", 0)}
     seen = set()
     for el in chain:
         for key in ("marL", "indent", "algn", "defTabSz"):
             if key not in seen and el.get(key) is not None:
                 seen.add(key)
                 res[key] = el.get(key) if key == "algn" else int(el.get(key))
+        for key in ("lnSpc", "spcBef", "spcAft"):
+            spc = el.find("a:" + key, _NS)
+            if key in seen or spc is None:
+                continue
+            pct, pts = spc.find("a:spcPct", _NS), spc.find("a:spcPts", _NS)
+            if pct is not None and pct.get("val"):
+                res[key] = ("pct", int(pct.get("val")) / 100000.0)
+            elif pts is not None and pts.get("val"):
+                res[key] = ("pts", int(pts.get("val")) * 127)  # hundredths of a point -> EMU
+            else:
+                continue
+            seen.add(key)
         if "tabs" not in seen:
             tabs = [(int(t.get("pos")), t.get("algn", "l")) for t in el.iter(_A_NS + "tab")
                     if t.get("pos") is not None]
@@ -488,15 +502,37 @@ def _run_props(canvas, shape, para, run):
     return (size or 18 * 12700), bool(bold), bool(italic), name
 
 
-def _font_scale(text_frame):
-    """Scale applied by PowerPoint's 'shrink text on overflow' (normAutofit fontScale)."""
+def _font_scale(text_frame, attr="fontScale"):
+    """Scale applied by PowerPoint's 'shrink text on overflow' (normAutofit fontScale);
+    with attr="lnSpcReduction" the fraction by which percentage line spacing is reduced."""
     try:
         el = text_frame._txBody.bodyPr.find("a:normAutofit", _NS)
-        if el is not None and el.get("fontScale"):
-            return int(el.get("fontScale")) / 100000.0
+        if el is not None and el.get(attr):
+            return int(el.get(attr)) / 100000.0
     except Exception:
         pass
-    return 1.0
+    return 1.0 if attr == "fontScale" else 0.0
+
+
+_INSETS = {"lIns": 91440, "tIns": 45720, "rIns": 91440, "bIns": 45720, "spcFirstLastPara": "0"}
+
+
+def _body_props(text_frame, shape):
+    """bodyPr insets (EMU) and spcFirstLastPara, inherited from layout/master placeholders."""
+    chain = [text_frame._txBody.bodyPr]
+    cur = shape
+    while cur is not None and cur.is_placeholder:
+        cur = getattr(cur, "_base_placeholder", None)
+        if cur is not None:
+            chain += cur._element.xpath("p:txBody/a:bodyPr")
+    res = {}
+    for key, default in _INSETS.items():
+        value = next((el.get(key) for el in chain if el is not None and el.get(key) is not None), None)
+        if key == "spcFirstLastPara":
+            res[key] = value in ("1", "true")
+        else:
+            res[key] = int(value) if value is not None else default
+    return res
 
 
 def _text_rotation(shape_rotation, text_frame):
@@ -656,16 +692,18 @@ def _draw_text(canvas, text_frame, box, default_color=(0, 0, 0), rotation=0, sha
 
 def _render_text(canvas, target, text_frame, box, default_color, shape=None, measure=False, anchor=None):
     x0, y0, x1, y1 = box
-    pad_l = canvas.px(text_frame.margin_left)
-    pad_r = canvas.px(text_frame.margin_right)
-    pad_t = canvas.px(text_frame.margin_top)
-    pad_b = canvas.px(text_frame.margin_bottom)
+    body = _body_props(text_frame, shape)
+    pad_l, pad_r = canvas.px(body["lIns"]), canvas.px(body["rIns"])
+    pad_t, pad_b = canvas.px(body["tIns"]), canvas.px(body["bIns"])
     avail = max(x1 - x0 - pad_l - pad_r, 1)
     draw = ImageDraw.Draw(target)
+    ln_reduction = _font_scale(text_frame, "lnSpcReduction")
 
     lines = []  # (placed items, line width, align, height)
+    paragraphs = []  # (index of first line, paragraph properties)
     for para in text_frame.paragraphs:
         props = _para_props(canvas, shape, para)
+        paragraphs.append((len(lines), props))
         stops, default_tab = props["tabs"], props["defTabSz"]
         mar_l, indent = props["marL"], props["indent"]
         align = _ALIGN.get(props["algn"], para.alignment)
@@ -683,8 +721,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None, mea
             if not is_br and not text:
                 continue
             size, bold, italic, name = _run_props(canvas, shape, para, r)
-            # always render 1pt smaller than specified
-            size = max(size * _font_scale(text_frame) - 12700, 12700)
+            size *= _font_scale(text_frame)
             fpx = canvas.px(size)
             font = _font(fpx, bold, name, italic)
             color = _run_color(canvas, shape, para, r, default_color)
@@ -698,10 +735,16 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None, mea
                 continue
             for tok in _TOKEN_RE.findall(text):
                 tokens.append((tok, font, color, fpx, underline))
-        if not tokens:
-            h = canvas.px(Emu(127000))
-            lines.append(([], 0, align, h * 1.2))
-            continue
+        if not tokens or tokens[-1][0] == "\n":
+            # empty paragraph, or the empty line after a trailing break: sized by endParaRPr
+            end = type("_End", (), {})()
+            end._r = end
+            end.rPr = para._p.find("a:endParaRPr", _NS)
+            size = _run_props(canvas, shape, para, end)[0]
+            tokens.append(("\n", None, None, canvas.px(size * _font_scale(text_frame)), False))
+            if len(tokens) == 1:
+                lines.append(([], 0, align, tokens[0][3] * 1.2))
+                continue
 
         cur = []
 
@@ -732,6 +775,27 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None, mea
             cur.append(tok)
         flush()
 
+    # line spacing (reduced by normAutofit lnSpcReduction), space before / after paragraphs;
+    # extra space goes above the text, which is drawn offset within its line
+    offsets = [0.0] * len(lines)
+    ends = [start for start, _p in paragraphs[1:]] + [len(lines)]
+    for n, ((start, props), end) in enumerate(zip(paragraphs, ends)):
+        if start == end:
+            continue
+        kind, value = props["lnSpc"]
+        for i in range(start, end):
+            placed, width, align, natural = lines[i]  # natural: font size * 1.2
+            h = canvas.px(value) if kind == "pts" else natural * max(value - ln_reduction, 0)
+            offsets[i] = h - natural
+            lines[i] = (placed, width, align, h)
+        for key, i in (("spcBef", start), ("spcAft", end - 1)):
+            if not body["spcFirstLastPara"] and n == (0 if key == "spcBef" else len(paragraphs) - 1):
+                continue
+            kind, value = props[key]
+            extra = canvas.px(value) if kind == "pts" else value * lines[i][3]
+            offsets[i] += extra if key == "spcBef" else 0
+            lines[i] = lines[i][:3] + (lines[i][3] + extra,)
+
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
     total = sum(l[3] for l in lines)
     if measure:
@@ -743,7 +807,7 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None, mea
         y += (inner_h - total) / 2
     elif anchor == MSO_ANCHOR.BOTTOM:
         y += inner_h - total
-    for placed, line_w, align, h in lines:
+    for (placed, line_w, align, h), offset in zip(lines, offsets):
         shift = 0
         if align == PP_ALIGN.CENTER:
             shift = (avail - line_w) / 2
@@ -751,10 +815,10 @@ def _render_text(canvas, target, text_frame, box, default_color, shape=None, mea
             shift = avail - line_w
         for x, text, font, color, ul in placed:
             tx, shown = x0 + pad_l + shift + x, text.rstrip(" ")
-            _draw_run(target, draw, (tx, y), shown, font, color)
+            _draw_run(target, draw, (tx, y + offset), shown, font, color)
             if ul and shown:
                 asc, _desc = font.getmetrics()
-                uy = y + asc + max(font.size * 0.08, 1)
+                uy = y + offset + asc + max(font.size * 0.08, 1)
                 draw.line([(tx, uy), (tx + _tlen(draw, shown, font), uy)],
                           fill=color, width=max(round(font.size / 14), 1))
         y += h

@@ -191,7 +191,7 @@ def test_indentation_without_tab(tmp_path):
     assert min(cols) >= 300  # 1in box + 0.1in inset + 2in indent -> 310px
 
 
-def test_font_one_point_smaller(tmp_path):
+def test_font_size_as_specified(tmp_path):
     from render_pptx import renderer
     sizes = []
     orig = renderer._font
@@ -209,7 +209,7 @@ def test_font_one_point_smaller(tmp_path):
         render_slide(path, 0, width=720)  # 720px / 10in = 72 px per in = 1px per pt
     finally:
         renderer._font = orig
-    assert sizes == [19]
+    assert sizes == [20]
 
 
 def test_theme_text_color(tmp_path):
@@ -303,7 +303,7 @@ def test_inherited_size_and_font_name(tmp_path):
         renderer._font = orig
     assert seen[0][0] > 19  # title is not rendered with the 18pt fallback
     assert seen[0][1] == "Calibri"
-    assert seen[-1] == (17, "DejaVu Sans")
+    assert seen[-1] == (18, "DejaVu Sans")
 
 
 def test_inherited_indentation_and_tabs(tmp_path):
@@ -478,3 +478,96 @@ def test_outline_color_weight_and_dash(tmp_path):
     x_dash = next(x for x, r in zip(range(round(Inches(1) * scale) + 12, 10 ** 6), red) if r)
     px = img.getpixel((x_dash, y - 3))
     assert px[0] == 255 and px[1] < 30
+
+
+def _last_dark_row(img):
+    gray = img.convert("L")
+    return max(y for y in range(img.height) if any(gray.getpixel((x, y)) < 128 for x in range(300)))
+
+
+def _break_deck(tmp_path, trailing_break, empty_para_size=None):
+    from pptx.util import Pt
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tf = slide.shapes.add_textbox(Inches(0), Inches(0), Inches(8), Inches(5)).text_frame
+    tf.paragraphs[0].text = "first"
+    tf.paragraphs[0].runs[0].font.size = Pt(20)
+    if trailing_break:
+        tf.paragraphs[0].add_line_break()
+    if empty_para_size:
+        from lxml import etree
+        end = etree.SubElement(tf.add_paragraph()._p, "{http://schemas.openxmlformats.org/drawingml/2006/main}endParaRPr")
+        end.set("sz", str(empty_para_size * 100))
+    p = tf.add_paragraph()
+    p.text = "second"
+    p.runs[0].font.size = Pt(20)
+    path = tmp_path / "br.pptx"
+    prs.save(path)
+    return render_slide(path, 0, width=1000)
+
+
+def test_trailing_line_break_adds_empty_line(tmp_path):
+    plain = _last_dark_row(_break_deck(tmp_path, False))
+    with_br = _last_dark_row(_break_deck(tmp_path, True))
+    assert with_br - plain > 20  # one extra ~20pt line (~33px at 1000px width)
+
+
+def test_empty_paragraph_uses_end_paragraph_size(tmp_path):
+    small = _last_dark_row(_break_deck(tmp_path, False, empty_para_size=10))
+    large = _last_dark_row(_break_deck(tmp_path, False, empty_para_size=40))
+    assert large - small > 40
+
+
+def _spacing_deck(tmp_path, ppr_xml="", body_attrs=None):
+    from lxml import etree
+    from pptx.util import Pt
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tf = slide.shapes.add_textbox(Inches(0), Inches(0), Inches(8), Inches(5)).text_frame
+    for attr, value in (body_attrs or {}).items():
+        if attr == "lnSpcReduction":
+            etree.SubElement(tf._txBody.bodyPr, "{http://schemas.openxmlformats.org/drawingml/2006/main}normAutofit",
+                             lnSpcReduction=value)
+        else:
+            tf._txBody.bodyPr.set(attr, value)
+    for i, text in enumerate(("first", "second")):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = text
+        p.runs[0].font.size = Pt(20)
+        if ppr_xml:
+            ppr = p._p.get_or_add_pPr()
+            for child in etree.fromstring(
+                    '<x xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">%s</x>' % ppr_xml):
+                ppr.append(child)
+    path = tmp_path / "spc.pptx"
+    prs.save(path)
+    return _last_dark_row(render_slide(path, 0, width=1000))
+
+
+def test_line_spacing_percent_and_reduction(tmp_path):
+    plain = _spacing_deck(tmp_path)
+    double = _spacing_deck(tmp_path, '<a:lnSpc><a:spcPct val="200000"/></a:lnSpc>')
+    reduced = _spacing_deck(tmp_path, '<a:lnSpc><a:spcPct val="200000"/></a:lnSpc>',
+                            {"lnSpcReduction": "100000"})
+    # 20pt * 1.2 = 24pt = 33px per line at 1000px width; two lines each get one extra line
+    assert 60 < double - plain < 75
+    assert abs(reduced - plain) <= 2
+
+
+def test_space_before_and_after_paragraph(tmp_path):
+    plain = _spacing_deck(tmp_path)
+    spaced = _spacing_deck(tmp_path, '<a:spcBef><a:spcPts val="3600"/></a:spcBef>'
+                                     '<a:spcAft><a:spcPts val="3600"/></a:spcAft>')
+    # only the gap between the two paragraphs counts: 36pt + 36pt = 100px
+    assert 95 < spaced - plain < 105
+    first_last = _spacing_deck(tmp_path, '<a:spcBef><a:spcPts val="3600"/></a:spcBef>',
+                               {"spcFirstLastPara": "1"})
+    assert 95 < first_last - plain < 105
+
+
+def test_body_inset(tmp_path):
+    plain = _spacing_deck(tmp_path)
+    inset = _spacing_deck(tmp_path, body_attrs={"tIns": str(Inches(1))})
+    assert 90 < inset - plain < 100  # 1in replaces the default 0.05in top inset
